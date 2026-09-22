@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 
 try:
-    from garminconnect import Garmin
+    import garth
 except ImportError:
-    print("Error: Library 'garminconnect' ยังไม่ได้ติดตั้ง")
+    print("Error: Library 'garth' ยังไม่ได้ติดตั้ง")
     sys.exit(1)
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -24,10 +24,10 @@ if not TOKEN_DIR.exists():
         print(f"Error: ไม่พบโฟลเดอร์ Token กรุณารัน 'python connect_garmin.py' ก่อน")
         sys.exit(1)
 
-client = Garmin()
 try:
-    client.login(str(TOKEN_DIR))
-    token_str = client.garth.dumps()
+    client = garth.Client()
+    client.load(str(TOKEN_DIR))
+    token_str = client.dumps()
     print("\n" + "=" * 60)
     print("คัดลอกข้อความด้านล่างนี้ ไปใส่ใน Environment Variable 'GARMIN_TOKENS_BASE64' บน Render:")
     print("=" * 60)
