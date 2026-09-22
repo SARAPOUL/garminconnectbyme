@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
 LINE Bot Webhook Server for Garmin Connect & AI Running Coach
-รองรับการบันทึกน้ำหนัก, สรุปข้อมูลสุขภาพประจำวัน, และตอบคำถามการซ้อมวิ่งด้วย Gemini AI
+รองรับ:
+1. ดึงตารางซ้อมล่วงหน้า (Garmin Coach / Calendar Plan)
+2. วิเคราะห์คำแนะนำการซ้อมประจำวันแบบสั้นๆ อิงจาก Training Readiness & Sleep จริง
+3. ส่งแจ้งเตือนอัตโนมัติทุก 8 โมงเช้า (Push Message)
+4. โต้ตอบตามสั่งทันทีเมื่อพิมพ์ "ขอตารางวันนี้", "ตารางซ้อม"
+5. บันทึกน้ำหนักเข้า Garmin Connect
 """
 
+import asyncio
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -22,6 +28,7 @@ from linebot.v3.messaging import (
     ApiClient,
     Configuration,
     MessagingApi,
+    PushMessageRequest,
     ReplyMessageRequest,
     TextMessage,
 )
@@ -71,6 +78,7 @@ app = FastAPI(title="Garmin LINE Bot")
 
 # Cache Garmin Client
 _garmin_client = None
+_last_daily_push_date = None
 
 
 def get_garmin():
@@ -142,6 +150,21 @@ def reply_line(reply_token: str, text: str):
         )
 
 
+def push_line(to_user_id: str, text: str):
+    if not to_user_id:
+        print("[PUSH] Warning: LINE_ALLOWED_USER_ID is not configured, skipping push.")
+        return
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.push_message(
+            PushMessageRequest(
+                to=to_user_id,
+                messages=[TextMessage(text=text.strip())],
+            )
+        )
+    print(f"[PUSH] Sent daily notification to {to_user_id}")
+
+
 def handle_record_weight(user_text: str) -> str:
     pattern = r"(?:น้ำหนัก|หนัก|weight|wt)\s*[:=]?\s*(\d+(?:\.\d+)?)|^(\d{2,3}(?:\.\d+)?)\s*(?:kg|กก|กิโล)$"
     match = re.search(pattern, user_text.strip(), re.IGNORECASE)
@@ -189,9 +212,11 @@ def handle_today_summary() -> str:
 
         readiness_text = "-"
         try:
-            readiness = garmin.get_training_readiness(today)
-            if readiness and "score" in readiness:
-                readiness_text = f"{readiness['score']} ({readiness.get('level', '')})"
+            r = garmin.get_training_readiness(today)
+            if isinstance(r, list) and r:
+                readiness_text = f"{r[0].get('score', '-')} ({r[0].get('level', '')})"
+            elif isinstance(r, dict):
+                readiness_text = f"{r.get('score', '-')} ({r.get('level', '')})"
         except Exception:
             pass
 
@@ -208,6 +233,264 @@ def handle_today_summary() -> str:
         )
     except Exception as e:
         return f"❌ ไม่สามารถดึงข้อมูลสรุปได้: {e}"
+
+
+def handle_daily_workout_report() -> str:
+    """สร้างรายงานตารางซ้อมล่วงหน้า + คำแนะนำของวันนั้นจริงแบบสั้นๆ"""
+    try:
+        garmin = get_garmin()
+        tz_bkk = timezone(timedelta(hours=7))
+        today = datetime.now(tz_bkk).date()
+        today_str = today.isoformat()
+        end_date = today + timedelta(days=7)
+
+        # 1. ดึง Calendar Workouts จาก Garmin
+        cal1 = garmin.connectapi(f"/calendar-service/year/{today.year}/month/{today.month - 1}")
+        items = cal1.get("calendarItems", [])
+        if end_date.month != today.month:
+            try:
+                cal2 = garmin.connectapi(f"/calendar-service/year/{end_date.year}/month/{end_date.month - 1}")
+                items.extend(cal2.get("calendarItems", []))
+            except Exception:
+                pass
+
+        seen = set()
+        upcoming = []
+        today_workout = None
+
+        for i in items:
+            if i.get("itemType") == "workout" and today_str <= i.get("date", "") <= end_date.isoformat():
+                wid = i.get("workoutId")
+                if wid and wid not in seen:
+                    seen.add(wid)
+                    try:
+                        detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                        i["description"] = detail.get("description", "").strip()
+                    except Exception:
+                        i["description"] = ""
+                    upcoming.append(i)
+                    if i.get("date") == today_str and not today_workout:
+                        today_workout = i
+
+        upcoming.sort(key=lambda x: x.get("date"))
+
+        # 2. ดึงสถานะความพร้อมวันนี้
+        readiness_score = "-"
+        readiness_level = "-"
+        try:
+            r = garmin.get_training_readiness(today_str)
+            if isinstance(r, list) and r:
+                readiness_score = r[0].get("score", "-")
+                readiness_level = r[0].get("level", "-")
+            elif isinstance(r, dict):
+                readiness_score = r.get("score", "-")
+                readiness_level = r.get("level", "-")
+        except Exception:
+            pass
+
+        sleep_text = "-"
+        try:
+            s = garmin.get_sleep_data(today_str)
+            dto = s.get("dailySleepDTO", {})
+            sec = dto.get("sleepTimeSeconds", 0)
+            score = dto.get("sleepScores", {}).get("overall", {}).get("value", "-")
+            if sec > 0:
+                sleep_text = f"{round(sec / 3600, 1)} ชม. (Score: {score})"
+        except Exception:
+            pass
+
+        # 3. สร้างคำแนะนำโค้ช AI สั้นๆ จาก Gemini
+        advice = "พร้อมสำหรับการซ้อมวันนี้ คุมเพซตามแผนที่กำหนด"
+        if GEMINI_API_KEY and genai:
+            try:
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                prompt = (
+                    f"คุณคือ Personal Running Coach มืออาชีพ\n"
+                    f"วันนี้วันที่: {today_str}\n"
+                    f"แผนซ้อมวันนี้จาก Garmin: {today_workout.get('title') if today_workout else 'พักผ่อน (Rest Day)'}\n"
+                    f"รายละเอียดเป้าหมายเพซ/ระยะ: {today_workout.get('description') if today_workout else 'ไม่มี'}\n"
+                    f"ความพร้อมร่างกายเช้านี้:\n"
+                    f"- Training Readiness: {readiness_score} ({readiness_level})\n"
+                    f"- การนอนหลับ: {sleep_text}\n\n"
+                    f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
+                    f"ประเมินว่าควรวิ่งตามแผนปกติ หรือควรระวัง/ปรับลดเรื่องใด (เช่น หาก Readiness ต่ำ หรือนอนน้อย ควรเน้นอะไร):"
+                )
+                resp = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=prompt,
+                )
+                advice = resp.text.strip()
+            except Exception as e:
+                advice = f"คุมเพซตามแผนที่กำหนด ({e})"
+
+        # 4. ประกอบข้อความ
+        today_info = "🛌 พักผ่อน (Rest Day)"
+        if today_workout:
+            desc = today_workout.get("description", "").strip()
+            desc_str = f"\n  เป้าหมาย: {desc}" if desc else ""
+            today_info = f"🏃 {today_workout.get('title')}{desc_str}"
+
+        lines = [
+            f"☀️ ตารางซ้อม & ความพร้อมวันนี้ ({today_str})",
+            f"━━━━━━━━━━━━━━━━━━━",
+            f"🎯 แผนซ้อมวันนี้:",
+            f"{today_info}",
+            f"",
+            f"💡 คำแนะนำจากโค้ช AI:",
+            f"{advice}",
+            f"",
+            f"📊 สภาพร่างกายเช้านี้:",
+            f"• Training Readiness: {readiness_score} ({readiness_level})",
+            f"• การนอนหลับ: {sleep_text}",
+            f"",
+            f"━━━━━━━━━━━━━━━━━━━",
+            f"👉 พิมพ์ \"ตารางล่วงหน้า 7 วัน\" เพื่อดูแผนซ้อมสัปดาห์นี้",
+        ]
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ ไม่สามารถดึงตารางซ้อมได้: {e}"
+
+
+def handle_tomorrow_workout_report() -> str:
+    """สร้างรายงานตารางซ้อมของวันพรุ่งนี้ พร้อมคำแนะนำเตรียมตัวล่วงหน้า"""
+    try:
+        garmin = get_garmin()
+        tz_bkk = timezone(timedelta(hours=7))
+        now = datetime.now(tz_bkk)
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
+        tomorrow_str = tomorrow.isoformat()
+        end_date = tomorrow + timedelta(days=7)
+
+        # 1. ดึง Calendar Workouts จาก Garmin
+        cal1 = garmin.connectapi(f"/calendar-service/year/{tomorrow.year}/month/{tomorrow.month - 1}")
+        items = cal1.get("calendarItems", [])
+        if end_date.month != tomorrow.month:
+            try:
+                cal2 = garmin.connectapi(f"/calendar-service/year/{end_date.year}/month/{end_date.month - 1}")
+                items.extend(cal2.get("calendarItems", []))
+            except Exception:
+                pass
+
+        tomorrow_workout = None
+        for i in items:
+            if i.get("itemType") == "workout" and i.get("date") == tomorrow_str:
+                wid = i.get("workoutId")
+                try:
+                    detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                    i["description"] = detail.get("description", "").strip()
+                except Exception:
+                    i["description"] = ""
+                tomorrow_workout = i
+                break
+
+        # 2. สร้างคำแนะนำเตรียมตัวล่วงหน้าจาก Gemini
+        advice = "พักผ่อนคืนนี้ให้เพียงพอและเตรียมพร้อมสำหรับตารางซ้อมพรุ่งนี้"
+        if GEMINI_API_KEY and genai:
+            try:
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                prompt = (
+                    f"คุณคือ Personal Running Coach มืออาชีพ\n"
+                    f"วันพรุ่งนี้วันที่: {tomorrow_str}\n"
+                    f"แผนซ้อมพรุ่งนี้จาก Garmin: {tomorrow_workout.get('title') if tomorrow_workout else 'พักผ่อน (Rest Day)'}\n"
+                    f"รายละเอียดเป้าหมายเพซ/ระยะ: {tomorrow_workout.get('description') if tomorrow_workout else 'ไม่มี'}\n\n"
+                    f"ให้เขียนคำแนะนำเตรียมตัวล่วงหน้าสำหรับคืนนี้และก่อนซ้อมพรุ่งนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
+                    f"เช่น การเตรียมโภชนาการ การนอน หรือการวอร์มอัพเฉพาะสำหรับเซสชันนี้:"
+                )
+                resp = client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=prompt,
+                )
+                advice = resp.text.strip()
+            except Exception as e:
+                advice = f"เตรียมความพร้อมตามแผนการซ้อม ({e})"
+
+        tomorrow_info = "🛌 พักผ่อน (Rest Day)"
+        if tomorrow_workout:
+            desc = tomorrow_workout.get("description", "").strip()
+            desc_str = f"\n  เป้าหมาย: {desc}" if desc else ""
+            tomorrow_info = f"🏃 {tomorrow_workout.get('title')}{desc_str}"
+
+        lines = [
+            f"🌅 แผนการซ้อมวันพรุ่งนี้ ({tomorrow_str})",
+            f"━━━━━━━━━━━━━━━━━━━",
+            f"🎯 แผนซ้อมพรุ่งนี้:",
+            f"{tomorrow_info}",
+            f"",
+            f"💡 คำแนะนำเตรียมตัวล่วงหน้า:",
+            f"{advice}",
+            f"",
+            f"━━━━━━━━━━━━━━━━━━━",
+            f"👉 พิมพ์ \"ตารางล่วงหน้า 7 วัน\" เพื่อดูแผนซ้อมสัปดาห์นี้",
+        ]
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ ไม่สามารถดึงตารางซ้อมพรุ่งนี้ได้: {e}"
+
+
+def handle_upcoming_7days_report() -> str:
+    """สร้างรายงานตารางซ้อมล่วงหน้า 7 วัน"""
+    try:
+        garmin = get_garmin()
+        tz_bkk = timezone(timedelta(hours=7))
+        today = datetime.now(tz_bkk).date()
+        today_str = today.isoformat()
+        tomorrow_str = (today + timedelta(days=1)).isoformat()
+        end_date = today + timedelta(days=7)
+
+        cal1 = garmin.connectapi(f"/calendar-service/year/{today.year}/month/{today.month - 1}")
+        items = cal1.get("calendarItems", [])
+        if end_date.month != today.month:
+            try:
+                cal2 = garmin.connectapi(f"/calendar-service/year/{end_date.year}/month/{end_date.month - 1}")
+                items.extend(cal2.get("calendarItems", []))
+            except Exception:
+                pass
+
+        seen = set()
+        upcoming = []
+
+        for i in items:
+            if i.get("itemType") == "workout" and today_str <= i.get("date", "") <= end_date.isoformat():
+                wid = i.get("workoutId")
+                if wid and wid not in seen:
+                    seen.add(wid)
+                    try:
+                        detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                        i["description"] = detail.get("description", "").strip()
+                    except Exception:
+                        i["description"] = ""
+                    upcoming.append(i)
+
+        upcoming.sort(key=lambda x: x.get("date"))
+
+        lines = [
+            f"📅 ตารางซ้อมล่วงหน้า 7 วัน ({today_str} ถึง {end_date.isoformat()})",
+            f"━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if not upcoming:
+            lines.append("• ไม่พบตารางซ้อมในปฏิทิน 7 วันนี้")
+        else:
+            for w in upcoming:
+                w_date = w.get("date", "")
+                w_title = w.get("title", "Run")
+                w_desc = w.get("description", "").replace("\n", " ").strip()
+                short_desc = f" ({w_desc[:45]}...)" if len(w_desc) > 45 else (f" ({w_desc})" if w_desc else "")
+                tag = ""
+                if w_date == today_str:
+                    tag = " (วันนี้)"
+                elif w_date == tomorrow_str:
+                    tag = " (พรุ่งนี้)"
+                lines.append(f"• {w_date}{tag}: {w_title}{short_desc}")
+
+        lines.append("")
+        lines.append("👉 พิมพ์ 'วันนี้ซ้อมอะไร' หรือ 'พน.ซ้อมอะไร' เพื่อดูรายละเอียดและคำแนะนำ")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ ไม่สามารถดึงตารางซ้อมล่วงหน้าได้: {e}"
 
 
 def handle_recent_runs() -> str:
@@ -250,7 +533,6 @@ def ask_gemini_coach(question: str) -> str:
             "กรุณานำ API Key จาก Google AI Studio มาใส่เพื่อเปิดใช้งานระบบวิเคราะห์แผนซ้อมวิ่งด้วย AI"
         )
 
-    # ดึง Context จาก Garmin
     context = {}
     today = date.today().isoformat()
     try:
@@ -314,9 +596,64 @@ def ask_gemini_coach(question: str) -> str:
         return f"❌ เกิดข้อผิดพลาดในการประมวลผลคำตอบจาก Gemini: {e}"
 
 
+# Background Scheduler สำหรับส่ง 08:00 AM ทุกวัน
+async def morning_push_scheduler():
+    global _last_daily_push_date
+    tz_bkk = timezone(timedelta(hours=7))
+    print("[SCHEDULER] Daily 08:00 AM morning push notification worker started.")
+
+    while True:
+        try:
+            now = datetime.now(tz_bkk)
+            today_str = now.date().isoformat()
+
+            # ส่งเฉพาะช่วง 08:00 - 08:05 น. และยังไม่ได้ส่งวันนี้
+            if now.hour == 8 and now.minute < 5:
+                if _last_daily_push_date != today_str:
+                    print(f"[SCHEDULER] Triggering morning report for {today_str}...")
+                    report_text = handle_daily_workout_report()
+                    if LINE_ALLOWED_USER_ID:
+                        push_line(LINE_ALLOWED_USER_ID, report_text)
+                        _last_daily_push_date = today_str
+        except Exception as e:
+            print(f"[SCHEDULER] Error in scheduler loop: {e}")
+
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(morning_push_scheduler())
+
+
 @app.get("/")
 def index():
     return {"status": "ok", "message": "Garmin LINE Bot Server is running"}
+
+
+@app.get("/cron/daily-workout")
+@app.post("/cron/daily-workout")
+def cron_daily_workout():
+    """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอน 8 โมงเช้า เพื่อปลุก Render"""
+    global _last_daily_push_date
+    tz_bkk = timezone(timedelta(hours=7))
+    today_str = datetime.now(tz_bkk).date().isoformat()
+
+    report_text = handle_daily_workout_report()
+    if LINE_ALLOWED_USER_ID:
+        push_line(LINE_ALLOWED_USER_ID, report_text)
+        _last_daily_push_date = today_str
+        return {
+            "status": "success",
+            "message": "Daily workout report pushed successfully",
+            "date": today_str,
+            "recipient": LINE_ALLOWED_USER_ID,
+        }
+    return {
+        "status": "warning",
+        "message": "Report generated but LINE_ALLOWED_USER_ID not configured",
+        "report_preview": report_text[:100],
+    }
 
 
 @app.post("/callback")
@@ -353,42 +690,111 @@ def handle_message(event):
     # 1. เช็กคำสั่ง Help / เมนู
     if user_text.lower() in ["help", "วิธีใช้", "เมนู", "menu"]:
         help_msg = (
-            "📋 เมนูคำสั่งของ Garmin Assistant:\n"
+            "📋 เมนูคำสั่ง Garmin Assistant:\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "⚖️ บันทึกน้ำหนัก:\n"
-            "  พิมพ์เช่น: 'น้ำหนัก 68.5' หรือ 'หนัก 70'\n\n"
+            "🏃 เช็กตารางซ้อม:\n"
+            "  • วันนี้: พิมพ์ 'วันนี้ซ้อมอะไร' หรือ 'ขอตารางวันนี้'\n"
+            "  • พรุ่งนี้: พิมพ์ 'พน.ซ้อมอะไร' หรือ 'พรุ่งนี้ซ้อมอะไร'\n\n"
             "📊 สรุปสุขภาพวันนี้:\n"
             "  พิมพ์: 'สถานะ', 'วันนี้', หรือ 'สรุป'\n\n"
+            "⚖️ บันทึกน้ำหนัก:\n"
+            "  พิมพ์: 'น้ำหนัก 68.5' หรือ 'หนัก 70'\n\n"
             "🏃 ประวัติการวิ่ง:\n"
             "  พิมพ์: 'ประวัติวิ่ง' หรือ 'วิ่งล่าสุด'\n\n"
             "💬 ปรึกษาโค้ช AI:\n"
             "  พิมพ์คำถามทั่วไปได้ทันที เช่น:\n"
             "  - 'เดือนหน้าจะแข่ง 10k ต้องเตรียมตัวอย่างไร'\n"
-            "  - 'วันนี้ควรซ้อมวิ่งระยะเท่าไหร่ดี'\n"
-            "  - 'สภาพร่างกายตอนนี้พร้อมซ้อมหนักไหม'"
+            "  - 'เมื่อคืนนอนน้อย วันนี้ควรซ้อมไหม'"
         )
         reply_line(event.reply_token, help_msg)
         return
 
-    # 2. เช็กคำสั่งบันทึกน้ำหนัก
+    # 2. เช็กคำขอตารางซ้อมวันพรุ่งนี้ (ตรวจจับก่อนคำว่าซ้อมอะไรทั่วไป)
+    tomorrow_workout_triggers = [
+        "พน.ซ้อมอะไร",
+        "พน ซ้อมอะไร",
+        "พรุ่งนี้ซ้อมอะไร",
+        "ตารางพรุ่งนี้",
+        "ขอตารางพรุ่งนี้",
+        "พรุ่งนี้วิ่งอะไร",
+        "พน วิ่งอะไร",
+        "พน.วิ่งอะไร",
+        "tomorrow workout",
+    ]
+    # 2. เช็กคำขอตารางซ้อมล่วงหน้า 7 วัน
+    upcoming_triggers = [
+        "ตารางล่วงหน้า 7 วัน",
+        "ตารางล่วงหน้า7วัน",
+        "ตารางล่วงหน้า",
+        "ตาราง 7 วัน",
+        "ตาราง7วัน",
+        "ตารางซ้อม 7 วัน",
+        "ตารางซ้อม7วัน",
+        "7 วัน",
+        "7วัน",
+    ]
+    if any(k in user_text.lower() for k in upcoming_triggers):
+        upcoming_report = handle_upcoming_7days_report()
+        reply_line(event.reply_token, upcoming_report)
+        return
+
+    # 3. เช็กคำขอตารางซ้อมวันพรุ่งนี้
+    tomorrow_workout_triggers = [
+        "พน.ซ้อมอะไร",
+        "พน ซ้อมอะไร",
+        "พรุ่งนี้ซ้อมอะไร",
+        "ตารางพรุ่งนี้",
+        "ขอตารางพรุ่งนี้",
+        "พรุ่งนี้วิ่งอะไร",
+        "พน วิ่งอะไร",
+        "พน.วิ่งอะไร",
+        "tomorrow workout",
+    ]
+    if any(k in user_text.lower() for k in tomorrow_workout_triggers):
+        tomorrow_report = handle_tomorrow_workout_report()
+        reply_line(event.reply_token, tomorrow_report)
+        return
+
+    # 4. เช็กคำขอตารางซ้อมวันนี้
+    today_workout_triggers = [
+        "วันนี้ซ้อมอะไร",
+        "ซ้อมอะไรวันนี้",
+        "วันนี้วิ่งอะไร",
+        "วิ่งอะไรวันนี้",
+        "ขอตารางวันนี้",
+        "ตารางวันนี้",
+        "ตารางซ้อม",
+        "ซ้อมอะไร",
+        "วิ่งอะไร",
+        "workout",
+        "workouts",
+        "plan",
+        "schedule",
+    ]
+    if any(k in user_text.lower() for k in today_workout_triggers):
+        workout_report = handle_daily_workout_report()
+        reply_line(event.reply_token, workout_report)
+        return
+
+    # 3. เช็กคำสั่งบันทึกน้ำหนัก
     weight_res = handle_record_weight(user_text)
     if weight_res:
         reply_line(event.reply_token, weight_res)
         return
 
-    # 3. เช็กคำสั่งสรุปข้อมูลสุขภาพประจำวัน
+    # 4. เช็กคำสั่งสรุปข้อมูลสุขภาพประจำวัน
     if user_text.lower() in ["สถานะ", "วันนี้", "สรุป", "status", "today"]:
         summary_res = handle_today_summary()
         reply_line(event.reply_token, summary_res)
         return
 
-    # 4. เช็กคำสั่งประวัติการวิ่ง
+    # 5. เช็กคำสั่งประวัติการวิ่ง
     if user_text.lower() in ["ประวัติวิ่ง", "วิ่งล่าสุด", "runs", "activities"]:
         runs_res = handle_recent_runs()
         reply_line(event.reply_token, runs_res)
         return
 
-    # 5. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin)
+    # 6. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin)
     coach_reply = ask_gemini_coach(user_text)
     reply_line(event.reply_token, coach_reply)
 
