@@ -1,0 +1,6 @@
+garminconnect>=0.2.8
+python-dotenv
+fastapi
+uvicorn
+line-bot-sdk
+google-genai

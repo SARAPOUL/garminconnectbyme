@@ -1,0 +1,7 @@
+.env
+.garmin_tokens/
+.garminconnect/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
