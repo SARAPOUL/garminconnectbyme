@@ -90,6 +90,7 @@ def get_garmin():
 
     garmin = Garmin()
 
+    auth_errors = []
     # 1. เช็ก Token Base64 จาก Environment Variable
     tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
     if tokens_base64:
@@ -116,7 +117,12 @@ def get_garmin():
                 print(f"[AUTH] Successfully loaded Garmin tokens for {garmin.full_name} ({garmin.display_name})")
                 return _garmin_client
             except Exception as e:
+                auth_errors.append(f"Base64: {e}")
                 print(f"[AUTH] Error loading Base64 token via garth: {e}")
+        else:
+            auth_errors.append("Library mismatch: 'Garmin' has no 'garth'")
+    else:
+        auth_errors.append("ไม่พบ Environment Variable 'GARMIN_TOKENS_BASE64'")
 
     # 2. เช็กจากโฟลเดอร์ไฟล์ Token
     possible_dirs = [
@@ -134,10 +140,12 @@ def get_garmin():
                 print(f"[AUTH] Successfully loaded Garmin tokens from directory: {p}")
                 return _garmin_client
             except Exception as e:
+                auth_errors.append(f"Dir {p.name}: {e}")
                 print(f"[AUTH] Error loading from {p}: {e}")
 
+    detail = " | ".join(auth_errors) if auth_errors else "ไม่พบไฟล์ Token"
     raise RuntimeError(
-        "ไม่พบ Session Token กรุณาตรวจสอบการตั้งค่า GARMIN_TOKENS_BASE64 บน Render"
+        f"ไม่สามารถโหลด Session Garmin ได้ ({detail}) กรุณาตรวจสอบหรืออัปเดตค่า GARMIN_TOKENS_BASE64 บน Render"
     )
 
 
