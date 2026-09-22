@@ -386,17 +386,20 @@ def handle_daily_workout_report() -> str:
 
 
 def handle_tomorrow_workout_report() -> str:
-    """สร้างรายงานตารางซ้อมของวันพรุ่งนี้ พร้อมคำแนะนำเตรียมตัวล่วงหน้า"""
+    """สร้างรายงานตารางซ้อมของวันพรุ่งนี้ พร้อมนำข้อมูลของวันนี้/วันก่อนหน้ามาวิเคราะห์เตรียมตัว"""
     try:
         garmin = get_garmin()
         tz_bkk = timezone(timedelta(hours=7))
         now = datetime.now(tz_bkk)
         today = now.date()
+        today_str = today.isoformat()
+        yesterday = today - timedelta(days=1)
+        yesterday_str = yesterday.isoformat()
         tomorrow = today + timedelta(days=1)
         tomorrow_str = tomorrow.isoformat()
         end_date = tomorrow + timedelta(days=7)
 
-        # 1. ดึง Calendar Workouts จาก Garmin
+        # 1. ดึง Calendar Workouts สำหรับวันพรุ่งนี้ จาก Garmin
         cal1 = garmin.connectapi(f"/calendar-service/year/{tomorrow.year}/month/{tomorrow.month - 1}")
         items = cal1.get("calendarItems", [])
         if end_date.month != tomorrow.month:
@@ -418,18 +421,81 @@ def handle_tomorrow_workout_report() -> str:
                 tomorrow_workout = i
                 break
 
-        # 2. สร้างคำแนะนำเตรียมตัวล่วงหน้าจาก Gemini
+        # 2. ดึงข้อมูลการซ้อมและกิจกรรมของ วันนี้ หรือ วันก่อนหน้า
+        activities = []
+        try:
+            activities = garmin.get_activities(0, 5)
+        except Exception:
+            pass
+
+        today_acts = [a for a in activities if a.get("startTimeLocal", "")[:10] == today_str]
+        yesterday_acts = [a for a in activities if a.get("startTimeLocal", "")[:10] == yesterday_str]
+
+        today_activity_summary = "พักผ่อน (ไม่มีบันทึกกิจกรรม)"
+        if today_acts:
+            act_descs = []
+            for a in today_acts:
+                name = a.get("activityName", "Activity")
+                dist = (a.get("distance") or 0) / 1000
+                dur = (a.get("duration") or 0) / 60
+                speed = a.get("averageSpeed", 0)
+                pace_str = ""
+                if speed > 0:
+                    sec_per_km = 1000 / speed
+                    p_min, p_sec = divmod(int(sec_per_km), 60)
+                    pace_str = f" | Pace: {p_min}:{p_sec:02d}"
+                act_descs.append(f"{name} ({dist:.2f} km, {dur:.0f} นาที{pace_str})")
+            today_activity_summary = ", ".join(act_descs)
+        elif yesterday_acts:
+            act_descs = []
+            for a in yesterday_acts:
+                name = a.get("activityName", "Activity")
+                dist = (a.get("distance") or 0) / 1000
+                act_descs.append(f"{name} {dist:.2f} km")
+            today_activity_summary = f"พักผ่อน (วันก่อนหน้าซ้อม: {', '.join(act_descs)})"
+
+        # 3. ดึงสถานะความพร้อมร่างกายปัจจุบัน (Training Readiness & Sleep)
+        readiness_score = "-"
+        readiness_level = "-"
+        try:
+            r = garmin.get_training_readiness(today_str)
+            if isinstance(r, list) and r:
+                readiness_score = r[0].get("score", "-")
+                readiness_level = r[0].get("level", "-")
+            elif isinstance(r, dict):
+                readiness_score = r.get("score", "-")
+                readiness_level = r.get("level", "-")
+        except Exception:
+            pass
+
+        sleep_text = "-"
+        try:
+            s = garmin.get_sleep_data(today_str)
+            dto = s.get("dailySleepDTO", {})
+            sec = dto.get("sleepTimeSeconds", 0)
+            score = dto.get("sleepScores", {}).get("overall", {}).get("value", "-")
+            if sec > 0:
+                sleep_text = f"{round(sec / 3600, 1)} ชม. (Score: {score})"
+        except Exception:
+            pass
+
+        # 4. สร้างคำแนะนำเตรียมตัวล่วงหน้าจาก Gemini โดยเชื่อมโยงข้อมูลวันนี้กับพรุ่งนี้
         advice = "พักผ่อนคืนนี้ให้เพียงพอและเตรียมพร้อมสำหรับตารางซ้อมพรุ่งนี้"
         if GEMINI_API_KEY and genai:
             try:
                 client = genai.Client(api_key=GEMINI_API_KEY)
                 prompt = (
                     f"คุณคือ Personal Running Coach มืออาชีพ\n"
-                    f"วันพรุ่งนี้วันที่: {tomorrow_str}\n"
-                    f"แผนซ้อมพรุ่งนี้จาก Garmin: {tomorrow_workout.get('title') if tomorrow_workout else 'พักผ่อน (Rest Day)'}\n"
-                    f"รายละเอียดเป้าหมายเพซ/ระยะ: {tomorrow_workout.get('description') if tomorrow_workout else 'ไม่มี'}\n\n"
-                    f"ให้เขียนคำแนะนำเตรียมตัวล่วงหน้าสำหรับคืนนี้และก่อนซ้อมพรุ่งนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
-                    f"เช่น การเตรียมโภชนาการ การนอน หรือการวอร์มอัพเฉพาะสำหรับเซสชันนี้:"
+                    f"ข้อมูลประกอบการวิเคราะห์:\n"
+                    f"- วันนี้วันที่: {today_str}\n"
+                    f"- กิจกรรมการซ้อมวันนี้: {today_activity_summary}\n"
+                    f"- สภาพร่างกายปัจจุบัน: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
+                    f"- วันพรุ่งนี้วันที่: {tomorrow_str}\n"
+                    f"- แผนซ้อมวันพรุ่งนี้จาก Garmin: {tomorrow_workout.get('title') if tomorrow_workout else 'พักผ่อน (Rest Day)'}\n"
+                    f"- รายละเอียดเป้าหมายพรุ่งนี้: {tomorrow_workout.get('description') if tomorrow_workout else 'ไม่มี'}\n\n"
+                    f"คำสั่ง: ให้วิเคราะห์ความเชื่อมโยงระหว่างการซ้อม/สภาพร่างกายของวันนี้ เพื่อให้คำแนะนำเตรียมตัวสำหรับวันพรุ่งนี้ "
+                    f"เขียนคำแนะนำแบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
+                    f"เช่น หากวันนี้ซ้อมหนัก คืนนี้และก่อนวิ่งพรุ่งนี้ควรฟื้นฟูอย่างไร หรือหากวันนี้พักผ่อนเต็มที่ พรุ่งนี้พร้อมซ้อมตามแผนระดับใด:"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
@@ -447,7 +513,12 @@ def handle_tomorrow_workout_report() -> str:
             f"🎯 แผนซ้อมพรุ่งนี้:",
             f"{tomorrow_info}",
             f"",
-            f"💡 คำแนะนำเตรียมตัวล่วงหน้า:",
+            f"📊 สภาพร่างกาย & การซ้อมวันนี้ ({today_str}):",
+            f"• การซ้อมวันนี้: {today_activity_summary}",
+            f"• Training Readiness: {readiness_score} ({readiness_level})",
+            f"• การนอนหลับ: {sleep_text}",
+            f"",
+            f"💡 คำแนะนำเตรียมตัวจากโค้ช AI:",
             f"{advice}",
             f"",
             f"━━━━━━━━━━━━━━━━━━━",
@@ -1207,9 +1278,15 @@ def handle_message(event):
 
     # 7. เช็กคำขอตารางซ้อมวันพรุ่งนี้
     tomorrow_workout_triggers = [
+        "วันพน.ซ้อมอะไร",
+        "วันพน ซ้อมอะไร",
+        "วันพรุ่งนี้ซ้อมอะไร",
+        "วันพรุ่งนี้ ซ้อมอะไร",
         "พน.ซ้อมอะไร",
         "พน ซ้อมอะไร",
+        "พน. ซ้อมอะไร",
         "พรุ่งนี้ซ้อมอะไร",
+        "พรุ่งนี้ ซ้อมอะไร",
         "ตารางพรุ่งนี้",
         "ขอตารางพรุ่งนี้",
         "พรุ่งนี้วิ่งอะไร",
