@@ -80,27 +80,41 @@ def get_garmin():
 
     garmin = Garmin()
 
-    # 1. เช็ก Token Base64 จาก Environment Variable (สำหรับ Cloud เช่น Render)
+    # 1. เช็กจากโฟลเดอร์ไฟล์ Token (รองรับ Render Secret Files ที่ /etc/secrets และในโฟลเดอร์โปรเจกต์)
+    possible_dirs = [
+        TOKEN_DIR,
+        PROJECT_DIR,
+        Path.cwd(),
+        Path("/etc/secrets"),
+        Path.home() / ".garminconnect",
+    ]
+    for p in possible_dirs:
+        if (p / "oauth1_token.json").exists() and (p / "oauth2_token.json").exists():
+            try:
+                garmin.login(str(p))
+                _garmin_client = garmin
+                print(f"[AUTH] Successfully loaded Garmin tokens from directory: {p}")
+                return _garmin_client
+            except Exception as e:
+                print(f"[AUTH] Error loading from {p}: {e}")
+
+    # 2. เช็ก Token Base64 จาก Environment Variable
     tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
     if tokens_base64:
+        clean_token = "".join(tokens_base64.split())
+        missing_padding = len(clean_token) % 4
+        if missing_padding:
+            clean_token += "=" * (4 - missing_padding)
         try:
-            garmin.garth.loads(tokens_base64)
+            garmin.garth.loads(clean_token)
             _garmin_client = garmin
+            print("[AUTH] Successfully loaded Garmin tokens from Base64 Environment Variable")
             return _garmin_client
-        except Exception:
-            if os.path.exists(tokens_base64):
-                garmin.login(tokens_base64)
-                _garmin_client = garmin
-                return _garmin_client
-
-    # 2. เช็กจากโฟลเดอร์ Token ในเครื่อง
-    if TOKEN_DIR.exists():
-        garmin.login(str(TOKEN_DIR))
-        _garmin_client = garmin
-        return _garmin_client
+        except Exception as e:
+            print(f"[AUTH] Error loading Base64 token: {e}")
 
     raise RuntimeError(
-        f"ไม่พบ Session Token กรุณารัน 'python connect_garmin.py' ในเครื่อง หรือกำหนด GARMIN_TOKENS_BASE64 ใน Environment Variable"
+        "ไม่พบ Session Token กรุณาตรวจสอบการตั้งค่า Token บน Render (แนะนำใช้ Secret Files หรือกำหนด GARMIN_TOKENS_BASE64)"
     )
 
 
