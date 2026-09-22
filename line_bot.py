@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -237,31 +238,37 @@ def handle_today_summary() -> str:
 
 
 def call_gemini_with_fallback(client, prompt: str) -> str:
-    """เรียกใช้ Gemini API พร้อมระบบ Fallback Model เพื่อป้องกันปัญหา 503 Overload"""
+    """เรียกใช้ Gemini API พร้อมระบบ Fallback Model และ Retry เพื่อป้องกันปัญหา 503 Overload"""
     models_to_try = [
         os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+        "gemini-3.7-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
         "gemini-flash-latest",
-        "gemini-3.5-flash",
-        "gemini-2.5-flash-lite",
     ]
     last_err = None
     for model_name in models_to_try:
-        try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            text = resp.text or ""
-            if not text and hasattr(resp, "candidates") and resp.candidates:
-                for part in resp.candidates[0].content.parts:
-                    if hasattr(part, "text") and part.text:
-                        text += part.text
-            if text:
-                return text.strip()
-        except Exception as e:
-            last_err = e
-            print(f"[GEMINI] Warning: Model {model_name} failed: {e}. Trying fallback...")
-            continue
+        for attempt in range(2):
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                text = resp.text or ""
+                if not text and hasattr(resp, "candidates") and resp.candidates:
+                    for part in resp.candidates[0].content.parts:
+                        if hasattr(part, "text") and part.text:
+                            text += part.text
+                if text:
+                    return text.strip()
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                print(f"[GEMINI] Attempt {attempt + 1} for {model_name} failed: {err_str[:120]}")
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(1.5)
+                    continue
+                break
     raise RuntimeError(f"All Gemini models failed: {last_err}")
 
 
