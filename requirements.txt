@@ -1,4 +1,4 @@
-garminconnect>=0.2.8
+garminconnect==0.2.8
 python-dotenv
 fastapi
 uvicorn

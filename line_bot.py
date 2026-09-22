@@ -80,7 +80,24 @@ def get_garmin():
 
     garmin = Garmin()
 
-    # 1. เช็กจากโฟลเดอร์ไฟล์ Token (รองรับ Render Secret Files ที่ /etc/secrets และในโฟลเดอร์โปรเจกต์)
+    # 1. เช็ก Token Base64 จาก Environment Variable
+    tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
+    if tokens_base64:
+        clean_token = "".join(tokens_base64.split())
+        missing_padding = len(clean_token) % 4
+        if missing_padding:
+            clean_token += "=" * (4 - missing_padding)
+
+        if hasattr(garmin, "garth"):
+            try:
+                garmin.garth.loads(clean_token)
+                _garmin_client = garmin
+                print("[AUTH] Successfully loaded Garmin tokens via garth from Base64")
+                return _garmin_client
+            except Exception as e:
+                print(f"[AUTH] Error loading Base64 token via garth: {e}")
+
+    # 2. เช็กจากโฟลเดอร์ไฟล์ Token
     possible_dirs = [
         TOKEN_DIR,
         PROJECT_DIR,
@@ -89,7 +106,7 @@ def get_garmin():
         Path.home() / ".garminconnect",
     ]
     for p in possible_dirs:
-        if (p / "oauth1_token.json").exists() and (p / "oauth2_token.json").exists():
+        if (p / "oauth1_token.json").exists() or (p / "garmin_tokens.json").exists():
             try:
                 garmin.login(str(p))
                 _garmin_client = garmin
@@ -98,23 +115,8 @@ def get_garmin():
             except Exception as e:
                 print(f"[AUTH] Error loading from {p}: {e}")
 
-    # 2. เช็ก Token Base64 จาก Environment Variable
-    tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
-    if tokens_base64:
-        clean_token = "".join(tokens_base64.split())
-        missing_padding = len(clean_token) % 4
-        if missing_padding:
-            clean_token += "=" * (4 - missing_padding)
-        try:
-            garmin.garth.loads(clean_token)
-            _garmin_client = garmin
-            print("[AUTH] Successfully loaded Garmin tokens from Base64 Environment Variable")
-            return _garmin_client
-        except Exception as e:
-            print(f"[AUTH] Error loading Base64 token: {e}")
-
     raise RuntimeError(
-        "ไม่พบ Session Token กรุณาตรวจสอบการตั้งค่า Token บน Render (แนะนำใช้ Secret Files หรือกำหนด GARMIN_TOKENS_BASE64)"
+        "ไม่พบ Session Token กรุณาตรวจสอบการตั้งค่า GARMIN_TOKENS_BASE64 บน Render"
     )
 
 
