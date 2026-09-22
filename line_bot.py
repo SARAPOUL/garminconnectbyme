@@ -20,7 +20,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # FastAPI
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 # LINE Bot SDK v3
@@ -1171,28 +1171,32 @@ def index():
     return {"status": "ok", "message": "Garmin LINE Bot Server is running"}
 
 
+def _run_morning_report_task(today_str: str):
+    global _last_daily_push_date
+    try:
+        print(f"[CRON] Running background morning report for {today_str}...")
+        report_text = handle_daily_workout_report()
+        if LINE_ALLOWED_USER_ID:
+            push_line(LINE_ALLOWED_USER_ID, report_text)
+            _last_daily_push_date = today_str
+            print(f"[CRON] Daily report pushed successfully to {LINE_ALLOWED_USER_ID}")
+    except Exception as e:
+        print(f"[CRON] Error in background morning report: {e}")
+
+
 @app.get("/cron/daily-workout")
 @app.post("/cron/daily-workout")
-def cron_daily_workout():
+def cron_daily_workout(background_tasks: BackgroundTasks):
     """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอน 8 โมงเช้า เพื่อปลุก Render"""
-    global _last_daily_push_date
     tz_bkk = timezone(timedelta(hours=7))
     today_str = datetime.now(tz_bkk).date().isoformat()
 
-    report_text = handle_daily_workout_report()
-    if LINE_ALLOWED_USER_ID:
-        push_line(LINE_ALLOWED_USER_ID, report_text)
-        _last_daily_push_date = today_str
-        return {
-            "status": "success",
-            "message": "Daily workout report pushed successfully",
-            "date": today_str,
-            "recipient": LINE_ALLOWED_USER_ID,
-        }
+    background_tasks.add_task(_run_morning_report_task, today_str)
     return {
-        "status": "warning",
-        "message": "Report generated but LINE_ALLOWED_USER_ID not configured",
-        "report_preview": report_text[:100],
+        "status": "accepted",
+        "message": "Daily workout report task queued in background",
+        "date": today_str,
+        "recipient": LINE_ALLOWED_USER_ID,
     }
 
 
