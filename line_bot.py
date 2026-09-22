@@ -91,8 +91,19 @@ def get_garmin():
         if hasattr(garmin, "garth"):
             try:
                 garmin.garth.loads(clean_token)
+                if garmin.garth.profile:
+                    garmin.display_name = garmin.garth.profile.get("displayName")
+                    garmin.full_name = garmin.garth.profile.get("fullName")
+                try:
+                    settings = garmin.garth.connectapi(
+                        "/userprofile-service/userprofile/user-settings"
+                    )
+                    garmin.unit_system = settings.get("userData", {}).get("measurementSystem")
+                except Exception:
+                    pass
+
                 _garmin_client = garmin
-                print("[AUTH] Successfully loaded Garmin tokens via garth from Base64")
+                print(f"[AUTH] Successfully loaded Garmin tokens for {garmin.full_name} ({garmin.display_name})")
                 return _garmin_client
             except Exception as e:
                 print(f"[AUTH] Error loading Base64 token via garth: {e}")
