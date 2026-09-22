@@ -10,6 +10,7 @@ LINE Bot Webhook Server for Garmin Connect & AI Running Coach
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -235,6 +236,35 @@ def handle_today_summary() -> str:
         return f"❌ ไม่สามารถดึงข้อมูลสรุปได้: {e}"
 
 
+def call_gemini_with_fallback(client, prompt: str) -> str:
+    """เรียกใช้ Gemini API พร้อมระบบ Fallback Model เพื่อป้องกันปัญหา 503 Overload"""
+    models_to_try = [
+        os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+        "gemini-flash-latest",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+    last_err = None
+    for model_name in models_to_try:
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            text = resp.text or ""
+            if not text and hasattr(resp, "candidates") and resp.candidates:
+                for part in resp.candidates[0].content.parts:
+                    if hasattr(part, "text") and part.text:
+                        text += part.text
+            if text:
+                return text.strip()
+        except Exception as e:
+            last_err = e
+            print(f"[GEMINI] Warning: Model {model_name} failed: {e}. Trying fallback...")
+            continue
+    raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+
 def handle_daily_workout_report() -> str:
     """สร้างรายงานตารางซ้อมล่วงหน้า + คำแนะนำของวันนั้นจริงแบบสั้นๆ"""
     try:
@@ -315,11 +345,7 @@ def handle_daily_workout_report() -> str:
                     f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
                     f"ประเมินว่าควรวิ่งตามแผนปกติ หรือควรระวัง/ปรับลดเรื่องใด (เช่น หาก Readiness ต่ำ หรือนอนน้อย ควรเน้นอะไร):"
                 )
-                resp = client.models.generate_content(
-                    model="gemini-3.6-flash",
-                    contents=prompt,
-                )
-                advice = resp.text.strip()
+                advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
                 advice = f"คุมเพซตามแผนที่กำหนด ({e})"
 
@@ -398,11 +424,7 @@ def handle_tomorrow_workout_report() -> str:
                     f"ให้เขียนคำแนะนำเตรียมตัวล่วงหน้าสำหรับคืนนี้และก่อนซ้อมพรุ่งนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
                     f"เช่น การเตรียมโภชนาการ การนอน หรือการวอร์มอัพเฉพาะสำหรับเซสชันนี้:"
                 )
-                resp = client.models.generate_content(
-                    model="gemini-3.6-flash",
-                    contents=prompt,
-                )
-                advice = resp.text.strip()
+                advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
                 advice = f"เตรียมความพร้อมตามแผนการซ้อม ({e})"
 
@@ -587,13 +609,417 @@ def ask_gemini_coach(question: str) -> str:
             f"กรุณาตอบคำแนะนำอย่างเป็นมืออาชีพและกระชับ:"
         )
 
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-        )
-        return response.text.strip()
+        return call_gemini_with_fallback(client, prompt)
     except Exception as e:
         return f"❌ เกิดข้อผิดพลาดในการประมวลผลคำตอบจาก Gemini: {e}"
+
+
+# -------------------------------------------------------------
+# ระบบออกแบบตารางซ้อมแบบ Custom (AI Coach & Garmin Sync)
+# -------------------------------------------------------------
+DRAFT_PLAN_FILE = PROJECT_DIR / "latest_draft_plan.json"
+
+THAI_MONTHS = {
+    "ม.ค.": 1, "มกรา": 1, "มกราคม": 1,
+    "ก.พ.": 2, "กุมภา": 2, "กุมภาพันธ์": 2,
+    "มี.ค.": 3, "มีนา": 3, "มีนาคม": 3,
+    "เม.ย.": 4, "เมษา": 4, "เมษายน": 4,
+    "พ.ค.": 5, "พฤษภา": 5, "พฤษภาคม": 5,
+    "มิ.ย.": 6, "มิถุนา": 6, "มิถุนายน": 6,
+    "ก.ค.": 7, "กรกฎา": 7, "กรกฎาคม": 7,
+    "ส.ค.": 8, "สิงหา": 8, "สิงหาคม": 8,
+    "ก.ย.": 9, "กันยา": 9, "กันยายน": 9,
+    "ต.ค.": 10, "ตุลา": 10, "ตุลาคม": 10,
+    "พ.ย.": 11, "พฤศจิกา": 11, "พฤศจิกายน": 11,
+    "ธ.ค.": 12, "ธันวา": 12, "ธันวาคม": 12,
+}
+
+
+def clear_draft_plan():
+    """ลบแบบร่างตารางซ้อมที่รอการยืนยัน"""
+    try:
+        if DRAFT_PLAN_FILE.exists():
+            DRAFT_PLAN_FILE.unlink()
+            print("[PLAN] Cleared pending draft plan.")
+    except Exception as e:
+        print(f"[PLAN] Error clearing draft plan: {e}")
+
+
+def save_draft_plan(user_id: str, plan_data: dict):
+    """บันทึกแบบร่างตารางซ้อมลงไฟล์ JSON"""
+    try:
+        payload = {
+            "user_id": user_id,
+            "timestamp": datetime.now().isoformat(),
+            "data": plan_data,
+        }
+        with open(DRAFT_PLAN_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[PLAN] Saved draft plan for user {user_id}")
+    except Exception as e:
+        print(f"[PLAN] Error saving draft plan: {e}")
+
+
+def load_draft_plan(user_id: str = None) -> dict:
+    """โหลดแบบร่างตารางซ้อมล่าสุด"""
+    try:
+        if not DRAFT_PLAN_FILE.exists():
+            return None
+        with open(DRAFT_PLAN_FILE, "r", encoding="utf-8") as f:
+            content = json.load(f)
+
+        if user_id and content.get("user_id") and content.get("user_id") != user_id:
+            return None
+
+        created_at_str = content.get("timestamp")
+        if created_at_str:
+            created_dt = datetime.fromisoformat(created_at_str)
+            if (datetime.now() - created_dt).total_seconds() > 7200:
+                clear_draft_plan()
+                return None
+        return content.get("data")
+    except Exception as e:
+        print(f"[PLAN] Error loading draft plan: {e}")
+        return None
+
+
+def parse_workout_redesign_request(text: str, current_date: date):
+    """วิเคราะห์ข้อความเพื่อระบุเป้าหมายระยะทาง (มาราธอน, ฮาล์ฟ, 10k, 5k) และวันสิ้นสุด"""
+    text_lower = text.lower()
+
+    # 1. ตรวจจับเป้าหมายระยะทาง
+    target_goal = "การพัฒนาความฟิตทั่วไป (General Fitness)"
+    if any(k in text_lower for k in ["มาราธอน", "ฟูลมาราธอน", "marathon", "full marathon", "42.195", "42k", "42 k"]):
+        if not any(k in text_lower for k in ["ฮาล์ฟ", "ฮาฟ", "half", "มินิ", "mini"]):
+            target_goal = "ฟูลมาราธอน (Full Marathon 42.195 km)"
+    if any(k in text_lower for k in ["ฮาล์ฟ", "ฮาฟ", "half", "half marathon", "21.1", "21k", "21 k"]):
+        target_goal = "ฮาล์ฟมาราธอน (Half Marathon 21.1 km)"
+    elif any(k in text_lower for k in ["10k", "10 k", "10km", "มินิ", "มินิมาราธอน", "mini marathon", "10 กิโล", "10กิโล"]):
+        target_goal = "มินิมาราธอน (Mini Marathon 10 km)"
+    elif any(k in text_lower for k in ["5k", "5 k", "5km", "5 กิโล", "5กิโล"]):
+        target_goal = "ระยะ 5 กิโลเมตร (5 km Run)"
+
+    # 2. ตรวจจับวันสิ้นสุด (ค่าเริ่มต้น 7 วัน รวมวันนี้)
+    end_date = current_date + timedelta(days=6)
+
+    # 2.1 แบบระบุวันและชื่อเดือนไทย เช่น "ถึง 10 ต.ค.", "ถึงวันที่ 10 ตุลาคม"
+    month_pattern = "|".join(re.escape(k) for k in sorted(THAI_MONTHS.keys(), key=len, reverse=True))
+    date_match = re.search(r'(?:ถึง|จนถึง|ก่อน)\s*(?:วันที่)?\s*(\d{1,2})\s*(' + month_pattern + r')(?:\s*(\d{2,4}))?', text_lower)
+
+    if date_match:
+        day = int(date_match.group(1))
+        month_str = date_match.group(2)
+        month = THAI_MONTHS.get(month_str, current_date.month)
+        year = current_date.year
+        if date_match.group(3):
+            y_val = int(date_match.group(3))
+            year = y_val - 543 if y_val > 2400 else y_val
+        else:
+            if month < current_date.month or (month == current_date.month and day < current_date.day):
+                year += 1
+        try:
+            target_dt = date(year, month, day)
+            if target_dt >= current_date:
+                end_date = target_dt
+        except ValueError:
+            pass
+    else:
+        # 2.2 แบบตัวเลข เช่น "ถึง 10/10"
+        num_date_match = re.search(r'(?:ถึง|จนถึง)\s*(?:วันที่)?\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?', text_lower)
+        if num_date_match:
+            day = int(num_date_match.group(1))
+            month = int(num_date_match.group(2))
+            year = current_date.year
+            if num_date_match.group(3):
+                y_val = int(num_date_match.group(3))
+                year = y_val - 543 if y_val > 2400 else y_val
+            else:
+                if month < current_date.month or (month == current_date.month and day < current_date.day):
+                    year += 1
+            try:
+                target_dt = date(year, month, day)
+                if target_dt >= current_date:
+                    end_date = target_dt
+            except ValueError:
+                pass
+        else:
+            # 2.3 แบบระบุระยะเวลา เช่น "2 สัปดาห์", "10 วัน"
+            dur_match = re.search(r'(\d{1,2})\s*(วัน|สัปดาห์|week)', text_lower)
+            if dur_match:
+                val = int(dur_match.group(1))
+                unit = dur_match.group(2)
+                if "สัปดาห์" in unit or "week" in unit:
+                    end_date = current_date + timedelta(days=(val * 7) - 1)
+                else:
+                    end_date = current_date + timedelta(days=max(1, val) - 1)
+
+    # จำกัดวันให้อยู่ในช่วง 1 - 28 วันเพื่อความเหมาะสมของ API
+    days_diff = (end_date - current_date).days + 1
+    if days_diff > 28:
+        end_date = current_date + timedelta(days=27)
+        days_diff = 28
+    elif days_diff < 1:
+        end_date = current_date
+        days_diff = 1
+
+    return target_goal, end_date, days_diff
+
+
+def generate_custom_training_plan(user_id: str, user_text: str) -> str:
+    """สร้างแผนการซ้อมวิ่งแบบ Custom จากข้อมูลจริงของ Garmin Connect ร่วมกับ Gemini AI"""
+    if not GEMINI_API_KEY:
+        return "💡 ไม่พบ GEMINI_API_KEY กรุณากำหนดในไฟล์ .env เพื่อใช้งานการออกแบบตารางซ้อม"
+
+    tz_bkk = timezone(timedelta(hours=7))
+    current_dt = datetime.now(tz_bkk).date()
+    target_goal, end_date, total_days = parse_workout_redesign_request(user_text, current_dt)
+    start_date_str = current_dt.isoformat()
+    end_date_str = end_date.isoformat()
+
+    context = {}
+    try:
+        garmin = get_garmin()
+        context["today_summary"] = garmin.get_user_summary(start_date_str)
+        context["race_predictions"] = garmin.get_race_predictions()
+        context["training_readiness"] = garmin.get_training_readiness(start_date_str)
+        context["vo2max"] = garmin.get_max_metrics(start_date_str)
+        acts = garmin.get_activities(0, 10)
+        running_acts = [
+            a for a in acts
+            if "run" in a.get("activityType", {}).get("typeKey", "").lower()
+        ]
+        context["recent_runs"] = [
+            {
+                "date": a.get("startTimeLocal", "")[:10],
+                "distance_km": round((a.get("distance") or 0) / 1000, 2),
+                "duration_min": round((a.get("duration") or 0) / 60, 1),
+                "avg_hr": a.get("averageHR"),
+            }
+            for a in running_acts[:5]
+        ]
+    except Exception as e:
+        context["note"] = f"ไม่สามารถดึงข้อมูล Garmin บางส่วนได้: {e}"
+
+    prompt = f"""คุณคือ Personal Running Coach มืออาชีพระดับโอลิมปิก
+ภารกิจ: ออกแบบตารางซ้อมวิ่งแบบเฉพาะบุคคลใหม่ทั้งหมด ตั้งแต่วันที่ {start_date_str} ถึง {end_date_str} (รวม {total_days} วัน)
+เป้าหมายการแข่งขัน/ฝึกซ้อม: {target_goal}
+
+[ข้อมูลสมรรถภาพทางกายจริงจาก Garmin Connect]:
+{json.dumps(context, ensure_ascii=False, indent=2)}
+
+หลักเกณฑ์การออกแบบตารางซ้อม:
+1. อิงหลักการฝึกซ้อม 80/20 (Easy Run 80% และ Quality Session เช่น Tempo/Interval/Long Run 20%)
+2. คำนึงถึงสมรรถภาพจริง (VO2 Max, เพซ และ Training Readiness ปัจจุบัน)
+3. ต้องมีวันพัก (Rest Day) 1-2 วันต่อสัปดาห์เพื่อการฟื้นตัวอย่างมีประสิทธิภาพ
+4. ระบุระยะทาง (km), เพซเป้าหมาย (เช่น "6:00-6:20 /km") และโครงสร้างการวิ่ง (Warmup, Main, Cooldown) ชัดเจน
+5. ตอบกลับเฉพาะโครงสร้าง JSON array ที่ถูกต้อง (Valid JSON array) เท่านั้น ห้ามใส่คำทักทายหรือ markdown code block อื่น นอกเหนือจาก JSON array:
+
+[
+  {{
+    "date": "YYYY-MM-DD",
+    "day_name": "วันอังคาร",
+    "workout_type": "Easy Run" | "Tempo Run" | "Interval" | "Long Run" | "Recovery Run" | "Rest Day",
+    "title": "Easy Run 5K",
+    "distance_km": 5.0,
+    "target_pace": "6:15 - 6:30 /km",
+    "warmup_sec": 300,
+    "cooldown_sec": 300,
+    "notes": "วิ่งสบายๆ โซน 2 คุมการหายใจ"
+  }}
+]"""
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        raw_text = call_gemini_with_fallback(client, prompt)
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+
+        workout_list = json.loads(raw_text)
+
+        plan_data = {
+            "target_goal": target_goal,
+            "start_date": start_date_str,
+            "end_date": end_date_str,
+            "total_days": total_days,
+            "workouts": workout_list,
+        }
+
+        save_draft_plan(user_id, plan_data)
+        return format_custom_plan_for_chat(plan_data)
+    except Exception as e:
+        return f"❌ เกิดข้อผิดพลาดในการออกแบบตารางซ้อมจาก AI: {e}"
+
+
+def format_custom_plan_for_chat(plan_data: dict) -> str:
+    """จัดรูปแบบข้อความตารางซ้อมสำหรับแสดงในแชต LINE"""
+    goal = plan_data.get("target_goal", "")
+    start_date = plan_data.get("start_date", "")
+    end_date = plan_data.get("end_date", "")
+    workouts = plan_data.get("workouts", [])
+
+    lines = [
+        "🏃 แผนซ้อมวิ่งใหม่ (AI Coach Redesign)",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"🎯 เป้าหมาย: {goal}",
+        f"📅 ช่วงเวลา: {start_date} ถึง {end_date} ({len(workouts)} วัน)",
+        "━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    type_emojis = {
+        "easy run": "🟢",
+        "recovery run": "🟢",
+        "tempo run": "🟡",
+        "tempo": "🟡",
+        "interval": "🔴",
+        "intervals": "🔴",
+        "long run": "🟣",
+        "rest day": "🛌",
+        "rest": "🛌",
+    }
+
+    for w in workouts:
+        w_date = w.get("date", "")
+        day_name = w.get("day_name", "")
+        w_type = w.get("workout_type", "Run")
+        w_title = w.get("title", w_type)
+        dist = w.get("distance_km", 0)
+        pace = w.get("target_pace", "-")
+        notes = w.get("notes", "").strip()
+
+        emoji = type_emojis.get(w_type.lower(), "🏃")
+
+        if "rest" in w_type.lower() or dist == 0:
+            lines.append(f"📅 [{w_date}] {day_name}: {emoji} {w_title}")
+            if notes:
+                lines.append(f"   💡 {notes}")
+        else:
+            lines.append(f"📅 [{w_date}] {day_name}: {emoji} {w_title}")
+            lines.append(f"   • ระยะทาง: {dist} km | เพซ: {pace}")
+            if notes:
+                lines.append(f"   • รายละเอียด: {notes}")
+        lines.append("")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━",
+        "❓ ต้องการอัปเดตตารางนี้เข้า Garmin Connect Calendar เลยไหม?",
+        "👉 พิมพ์ 'ยืนยันอัปเดตตาราง' เพื่อส่งเข้า Garmin ทันที",
+        "(หากพิมพ์ถามเรื่องอื่น จะถือว่ายกเลิกแบบร่างนี้อัตโนมัติ)",
+    ])
+
+    return "\n".join(lines)
+
+
+def push_plan_to_garmin(user_id: str) -> str:
+    """บันทึกแบบร่างตารางซ้อมเข้าสู่ Garmin Connect (สร้าง Workout และ Schedule ลง Calendar)"""
+    plan_data = load_draft_plan(user_id)
+    if not plan_data:
+        return "⚠️ ไม่พบแบบร่างตารางซ้อมล่าสุด กรุณาพิมพ์ 'อยากให้ออกแบบตารางซ้อมสัปดาห์นี้ใหม่' เพื่อให้ AI วิเคราะห์ก่อน"
+
+    try:
+        garmin = get_garmin()
+    except Exception as e:
+        return f"❌ ไม่สามารถเชื่อมต่อ Garmin Connect ได้: {e}"
+
+    workouts = plan_data.get("workouts", [])
+    created_count = 0
+    success_list = []
+    fail_list = []
+
+    for w in workouts:
+        w_type = w.get("workout_type", "")
+        dist_km = float(w.get("distance_km") or 0)
+        w_date = w.get("date", "")
+
+        # ข้ามวันพัก
+        if "rest" in w_type.lower() or dist_km <= 0:
+            continue
+
+        raw_title = w.get("title", "Run")
+        w_title = f"AI: {raw_title}"[:45]
+        warmup_sec = int(w.get("warmup_sec") or 300)
+        cooldown_sec = int(w.get("cooldown_sec") or 300)
+        dist_meters = dist_km * 1000
+        desc = f"{w.get('target_pace', '')} | {w.get('notes', '')}".strip()[:200]
+
+        steps = []
+        order = 1
+        if warmup_sec > 0:
+            steps.append({
+                "type": "ExecutableStepDTO",
+                "stepOrder": order,
+                "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": float(warmup_sec),
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
+            })
+            order += 1
+
+        steps.append({
+            "type": "ExecutableStepDTO",
+            "stepOrder": order,
+            "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+            "endCondition": {"conditionTypeId": 1, "conditionTypeKey": "distance"},
+            "endConditionValue": float(dist_meters),
+            "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
+        })
+        order += 1
+
+        if cooldown_sec > 0:
+            steps.append({
+                "type": "ExecutableStepDTO",
+                "stepOrder": order,
+                "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": float(cooldown_sec),
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
+            })
+
+        payload = {
+            "workoutName": w_title,
+            "description": desc,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSegments": [
+                {
+                    "segmentOrder": 1,
+                    "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+                    "workoutSteps": steps,
+                }
+            ],
+        }
+
+        try:
+            workout_res = garmin.connectapi("/workout-service/workout", method="POST", json=payload)
+            workout_id = workout_res.get("workoutId") or workout_res.get("workout_id")
+            if workout_id:
+                garmin.connectapi(f"/workout-service/schedule/{workout_id}", method="POST", json={"date": w_date})
+                created_count += 1
+                success_list.append(f"• [{w_date}] {w_title} ({dist_km} km)")
+            else:
+                fail_list.append(f"• [{w_date}] ไม่ได้รับ workoutId จาก Garmin")
+        except Exception as e:
+            print(f"[GARMIN API] Failed to schedule workout for {w_date}: {e}")
+            fail_list.append(f"• [{w_date}] เกิดข้อผิดพลาด: {e}")
+
+    # ล้างแบบร่างหลังดำเนินการ
+    clear_draft_plan()
+
+    lines = [
+        "✅ บันทึกตารางซ้อมเข้าสู่ Garmin Connect เรียบร้อยแล้ว!" if created_count > 0 else "❌ ไม่สามารถบันทึกตารางซ้อมเข้า Garmin ได้",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"📅 เพิ่มลง Calendar สำเร็จ {created_count} รายการ:",
+    ]
+    if success_list:
+        lines.extend(success_list)
+    if fail_list:
+        lines.append("\n⚠️ รายการที่พบปัญหา:")
+        lines.extend(fail_list)
+
+    lines.extend([
+        "",
+        "📱 ตรวจสอบและ Sync ตารางซ้อมเข้านาฬิกาผ่านแอป Garmin Connect ได้ทันที",
+    ])
+    return "\n".join(lines)
 
 
 # Background Scheduler สำหรับส่ง 08:00 AM ทุกวัน
@@ -687,14 +1113,60 @@ def handle_message(event):
     else:
         print(f"👉 TIP: สามารถนำ User ID นี้ '{user_id}' ไปใส่ใน LINE_ALLOWED_USER_ID ใน .env เพื่อล็อกให้บอทตอบเฉพาะคุณได้")
 
-    # 1. เช็กคำสั่ง Help / เมนู
+    # 1. เช็กคำสั่งยืนยันบันทึกตารางซ้อมเข้า Garmin
+    confirm_triggers = [
+        "ยืนยันอัปเดตตาราง",
+        "ยืนยันอัพเดตตาราง",
+        "ยืนยันตาราง",
+        "อัปเดตเข้า garmin",
+        "อัพเดตเข้า garmin",
+        "อัปเดตเข้าgarmin",
+        "อัพเดตเข้าgarmin",
+        "บันทึกตาราง",
+        "confirm plan",
+    ]
+    if any(k == user_text.lower() or k in user_text.lower() for k in confirm_triggers):
+        push_res = push_plan_to_garmin(user_id)
+        reply_line(event.reply_token, push_res)
+        return
+
+    # 2. เช็กคำสั่งยกเลิกแบบร่างตารางซ้อม
+    cancel_triggers = ["ยกเลิกตาราง", "ยกเลิกแบบร่าง", "ยกเลิก"]
+    if user_text.lower() in cancel_triggers:
+        clear_draft_plan()
+        reply_line(event.reply_token, "ยกเลิกแบบร่างตารางซ้อมเรียบร้อยแล้ว")
+        return
+
+    # 3. หากพิมพ์ข้อความอื่นใด ให้ถือว่ายกเลิกแบบร่างตารางซ้อมเดิมอัตโนมัติ
+    clear_draft_plan()
+
+    # 4. เช็กคำสั่งออกแบบตารางซ้อมใหม่ (AI Coach)
+    redesign_triggers = [
+        "ออกแบบตาราง",
+        "จัดตาราง",
+        "วางตาราง",
+        "ตารางซ้อมใหม่",
+        "ออกแบบซ้อม",
+    ]
+    if any(k in user_text.lower() for k in redesign_triggers):
+        custom_plan_msg = generate_custom_training_plan(user_id, user_text)
+        reply_line(event.reply_token, custom_plan_msg)
+        return
+
+    # 5. เช็กคำสั่ง Help / เมนู
     if user_text.lower() in ["help", "วิธีใช้", "เมนู", "menu"]:
         help_msg = (
             "📋 เมนูคำสั่ง Garmin Assistant:\n"
             "━━━━━━━━━━━━━━━━━━━\n"
             "🏃 เช็กตารางซ้อม:\n"
             "  • วันนี้: พิมพ์ 'วันนี้ซ้อมอะไร' หรือ 'ขอตารางวันนี้'\n"
-            "  • พรุ่งนี้: พิมพ์ 'พน.ซ้อมอะไร' หรือ 'พรุ่งนี้ซ้อมอะไร'\n\n"
+            "  • พรุ่งนี้: พิมพ์ 'พน.ซ้อมอะไร' หรือ 'พรุ่งนี้ซ้อมอะไร'\n"
+            "  • ล่วงหน้า 7 วัน: พิมพ์ 'ตารางล่วงหน้า 7 วัน'\n\n"
+            "✨ ออกแบบตารางซ้อมใหม่ (AI Coach):\n"
+            "  • 'อยากให้ออกแบบตารางซ้อมสัปดาห์นี้ใหม่'\n"
+            "  • 'ออกแบบตารางซ้อม ฮาล์ฟ มาราธอน ถึง 10ต.ค.'\n"
+            "  • 'จัดตารางซ้อม 10k 2 สัปดาห์'\n"
+            "  (รองรับ: มาราธอน, ฮาล์ฟมาราธอน, 10k, 5k)\n\n"
             "📊 สรุปสุขภาพวันนี้:\n"
             "  พิมพ์: 'สถานะ', 'วันนี้', หรือ 'สรุป'\n\n"
             "⚖️ บันทึกน้ำหนัก:\n"
@@ -703,25 +1175,13 @@ def handle_message(event):
             "  พิมพ์: 'ประวัติวิ่ง' หรือ 'วิ่งล่าสุด'\n\n"
             "💬 ปรึกษาโค้ช AI:\n"
             "  พิมพ์คำถามทั่วไปได้ทันที เช่น:\n"
-            "  - 'เดือนหน้าจะแข่ง 10k ต้องเตรียมตัวอย่างไร'\n"
-            "  - 'เมื่อคืนนอนน้อย วันนี้ควรซ้อมไหม'"
+            "  - 'เมื่อคืนนอนน้อย วันนี้ควรซ้อมไหม'\n"
+            "  - 'HR Zone 2 สำหรับฉันควรอยู่ที่เท่าไร'"
         )
         reply_line(event.reply_token, help_msg)
         return
 
-    # 2. เช็กคำขอตารางซ้อมวันพรุ่งนี้ (ตรวจจับก่อนคำว่าซ้อมอะไรทั่วไป)
-    tomorrow_workout_triggers = [
-        "พน.ซ้อมอะไร",
-        "พน ซ้อมอะไร",
-        "พรุ่งนี้ซ้อมอะไร",
-        "ตารางพรุ่งนี้",
-        "ขอตารางพรุ่งนี้",
-        "พรุ่งนี้วิ่งอะไร",
-        "พน วิ่งอะไร",
-        "พน.วิ่งอะไร",
-        "tomorrow workout",
-    ]
-    # 2. เช็กคำขอตารางซ้อมล่วงหน้า 7 วัน
+    # 6. เช็กคำขอตารางซ้อมล่วงหน้า 7 วัน
     upcoming_triggers = [
         "ตารางล่วงหน้า 7 วัน",
         "ตารางล่วงหน้า7วัน",
@@ -738,7 +1198,7 @@ def handle_message(event):
         reply_line(event.reply_token, upcoming_report)
         return
 
-    # 3. เช็กคำขอตารางซ้อมวันพรุ่งนี้
+    # 7. เช็กคำขอตารางซ้อมวันพรุ่งนี้
     tomorrow_workout_triggers = [
         "พน.ซ้อมอะไร",
         "พน ซ้อมอะไร",
@@ -755,7 +1215,7 @@ def handle_message(event):
         reply_line(event.reply_token, tomorrow_report)
         return
 
-    # 4. เช็กคำขอตารางซ้อมวันนี้
+    # 8. เช็กคำขอตารางซ้อมวันนี้
     today_workout_triggers = [
         "วันนี้ซ้อมอะไร",
         "ซ้อมอะไรวันนี้",
@@ -776,25 +1236,25 @@ def handle_message(event):
         reply_line(event.reply_token, workout_report)
         return
 
-    # 3. เช็กคำสั่งบันทึกน้ำหนัก
+    # 9. เช็กคำสั่งบันทึกน้ำหนัก
     weight_res = handle_record_weight(user_text)
     if weight_res:
         reply_line(event.reply_token, weight_res)
         return
 
-    # 4. เช็กคำสั่งสรุปข้อมูลสุขภาพประจำวัน
+    # 10. เช็กคำสั่งสรุปข้อมูลสุขภาพประจำวัน
     if user_text.lower() in ["สถานะ", "วันนี้", "สรุป", "status", "today"]:
         summary_res = handle_today_summary()
         reply_line(event.reply_token, summary_res)
         return
 
-    # 5. เช็กคำสั่งประวัติการวิ่ง
+    # 11. เช็กคำสั่งประวัติการวิ่ง
     if user_text.lower() in ["ประวัติวิ่ง", "วิ่งล่าสุด", "runs", "activities"]:
         runs_res = handle_recent_runs()
         reply_line(event.reply_token, runs_res)
         return
 
-    # 6. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin)
+    # 12. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin)
     coach_reply = ask_gemini_coach(user_text)
     reply_line(event.reply_token, coach_reply)
 
