@@ -275,36 +275,39 @@ def handle_today_summary() -> str:
 
 def call_gemini_with_fallback(client, prompt: str) -> str:
     """เรียกใช้ Gemini API พร้อมระบบ Fallback Model และ Retry เพื่อป้องกันปัญหา 503 Overload"""
-    models_to_try = [
-        os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+    candidate_models = [
+        os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
         "gemini-flash-latest",
     ]
+    seen = set()
+    models_to_try = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
+
     last_err = None
     for model_name in models_to_try:
-        for attempt in range(2):
-            try:
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                )
-                text = resp.text or ""
-                if not text and hasattr(resp, "candidates") and resp.candidates:
-                    for part in resp.candidates[0].content.parts:
-                        if hasattr(part, "text") and part.text:
-                            text += part.text
-                if text:
-                    return text.strip()
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                print(f"[GEMINI] Attempt {attempt + 1} for {model_name} failed: {err_str[:120]}")
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    time.sleep(1.5)
-                    continue
-                break
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            text = resp.text or ""
+            if not text and hasattr(resp, "candidates") and resp.candidates:
+                for part in resp.candidates[0].content.parts:
+                    if hasattr(part, "text") and part.text:
+                        text += part.text
+            if text:
+                return text.strip()
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            print(f"[GEMINI] Model {model_name} failed: {err_str[:120]}")
+            # ถ้าเจอ 503 หรือ 429 ให้ข้ามไปลองโมเดลถัดไปทันที
+            continue
     raise RuntimeError(f"All Gemini models failed: {last_err}")
 
 
@@ -390,7 +393,8 @@ def handle_daily_workout_report() -> str:
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
-                advice = f"คุมเพซตามแผนที่กำหนด ({e})"
+                print(f"[AI] Daily advice generation failed: {e}")
+                advice = "พร้อมสำหรับการซ้อมวันนี้ คุมเพซตามแผนที่กำหนดและสังเกตสัญญาณชีพจรของร่างกาย"
 
         # 4. ประกอบข้อความ
         today_info = "🛌 พักผ่อน (Rest Day)"
@@ -535,7 +539,8 @@ def handle_tomorrow_workout_report() -> str:
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
-                advice = f"เตรียมความพร้อมตามแผนการซ้อม ({e})"
+                print(f"[AI] Tomorrow advice generation failed: {e}")
+                advice = "เตรียมความพร้อมสำหรับการซ้อมพรุ่งนี้ พักผ่อนให้เพียงพอและสังเกตสภาพร่างกาย"
 
         tomorrow_info = "🛌 พักผ่อน (Rest Day)"
         if tomorrow_workout:
