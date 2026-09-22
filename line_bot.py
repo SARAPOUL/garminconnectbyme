@@ -43,6 +43,16 @@ except ImportError:
     print("Error: garminconnect is not installed")
     sys.exit(1)
 
+# Garth SSO Consumer Preset (ป้องกัน Timeout บน Cloud/Render จาก AWS S3)
+try:
+    import garth.sso
+    garth.sso.OAUTH_CONSUMER = {
+        "consumer_key": "fcad1b9b-81e8-495b-a24a-0a2c07cad970",
+        "consumer_secret": "E08UhVydFXcVOAnNsuDczEuELF6nlCdgiGk",
+    }
+except Exception:
+    pass
+
 # Google GenAI
 try:
     from google import genai
@@ -83,10 +93,21 @@ _garmin_client = None
 _last_daily_push_date = None
 
 
-def get_garmin():
+def get_garmin(force_refresh: bool = False):
     global _garmin_client
-    if _garmin_client is not None:
-        return _garmin_client
+    if _garmin_client is not None and not force_refresh:
+        # ตรวจสอบว่า OAuth2 Token ที่แคชไว้หมดอายุหรือไม่ ถ้าหมดให้ Auto-Refresh บน Cloud ทันที
+        if hasattr(_garmin_client, "garth") and getattr(_garmin_client.garth, "oauth2_token", None):
+            if _garmin_client.garth.oauth2_token.expired:
+                print("[AUTH] Cached OAuth2 token expired. Auto-refreshing on cloud via OAuth1...")
+                try:
+                    _garmin_client.garth.refresh_oauth2()
+                    print("[AUTH] Successfully refreshed cached OAuth2 token on cloud.")
+                except Exception as ref_err:
+                    print(f"[AUTH] Failed to refresh cached OAuth2: {ref_err}")
+                    _garmin_client = None
+        if _garmin_client is not None:
+            return _garmin_client
 
     garmin = Garmin()
 
@@ -94,7 +115,7 @@ def get_garmin():
     # 1. เช็ก Token Base64 จาก Environment Variable
     tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
     if tokens_base64:
-        clean_token = "".join(tokens_base64.split())
+        clean_token = "".join(tokens_base64.split()).strip("'\"")
         missing_padding = len(clean_token) % 4
         if missing_padding:
             clean_token += "=" * (4 - missing_padding)
@@ -102,6 +123,13 @@ def get_garmin():
         if hasattr(garmin, "garth"):
             try:
                 garmin.garth.loads(clean_token)
+
+                # ตรวจสอบและ Refresh ทันทีถ้า OAuth2 หมดอายุ โดยแลกเปลี่ยนผ่าน OAuth1 Token (อายุ 1 ปี)
+                if garmin.garth.oauth2_token and garmin.garth.oauth2_token.expired:
+                    print("[AUTH] OAuth2 token is expired. Auto-refreshing on cloud via OAuth1...")
+                    garmin.garth.refresh_oauth2()
+                    print("[AUTH] Successfully refreshed OAuth2 token on cloud via OAuth1 exchange!")
+
                 if garmin.garth.profile:
                     garmin.display_name = garmin.garth.profile.get("displayName")
                     garmin.full_name = garmin.garth.profile.get("fullName")
