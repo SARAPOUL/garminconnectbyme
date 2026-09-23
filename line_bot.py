@@ -361,8 +361,7 @@ def handle_today_summary() -> str:
                     profile = get_athlete_profile()
                     profile_summary = format_athlete_profile_summary(profile)
                     prompt = (
-                        f"คุณคือ Personal Running Coach มืออาชีพ\n"
-                        f"นักวิ่ง: คุณพรเทพ\n"
+                        f"คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ\n"
                         f"วันที่: {today}\n"
                         f"ข้อมูลการวิ่งวันนี้:\n" + "\n".join(today_run_lines) + "\n\n"
                         f"ความพร้อมร่างกายวันนี้: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
@@ -410,7 +409,7 @@ ATHLETE_PROFILE_FILE = PROJECT_DIR / "athlete_profile.json"
 
 
 def get_athlete_profile() -> dict:
-    """โหลดข้อมูลผลทดสอบ Lactate และโซนการฝึกซ้อมของนักกีฬา (เฉพาะ account คุณพรเทพ)"""
+    """โหลดข้อมูลผลทดสอบ Lactate และโซนการฝึกซ้อมของนักกีฬา"""
     try:
         if ATHLETE_PROFILE_FILE.exists():
             with open(ATHLETE_PROFILE_FILE, "r", encoding="utf-8") as f:
@@ -428,7 +427,7 @@ def format_athlete_profile_summary(profile: dict) -> str:
     lt1 = lt.get("LT1", {})
     lt2 = lt.get("LT2", {})
     return (
-        f"[ข้อมูล Lactate Threshold & โซนการฝึกซ้อมเฉพาะบุคคลของคุณพรเทพ]:\n"
+        f"[ข้อมูล Lactate Threshold & โซนการฝึกซ้อมเฉพาะบุคคล]:\n"
         f"• LT1 (Aerobic Threshold): Pace {lt1.get('pace_min_km', '05:27')} / HR {lt1.get('heart_rate_bpm', 172)} bpm | Lactate {lt1.get('lactate_mmol', 1.6)} mmol\n"
         f"• LT2 (Anaerobic / Threshold): Pace {lt2.get('pace_min_km', '04:37')} / HR {lt2.get('heart_rate_bpm', 187)} bpm | Lactate {lt2.get('lactate_mmol', 3.0)} mmol\n"
         f"• Easy Run / Recovery / Long Run: Pace 6:00 - 6:40 /km (หรือช้ากว่า 6:40), HR 160 - 170 bpm (< 172 bpm)\n"
@@ -440,7 +439,7 @@ def format_athlete_profile_summary(profile: dict) -> str:
 
 
 def handle_show_lactate_profile() -> str:
-    """แสดงข้อมูลผลการทดสอบ Lactate และโซนการซ้อมของคุณพรเทพ"""
+    """แสดงข้อมูลผลการทดสอบ Lactate และโซนการซ้อมของนักกีฬา"""
     profile = get_athlete_profile()
     if not profile:
         return "❌ ไม่พบข้อมูลผลทดสอบ Lactate ในระบบ"
@@ -731,7 +730,7 @@ def handle_daily_workout_report() -> str:
                 profile = get_athlete_profile()
                 profile_context = format_athlete_profile_summary(profile)
                 prompt = (
-                    f"คุณคือ Personal Running Coach มืออาชีพ\n"
+                    f"คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ\n"
                     f"บริบทวันที่และตารางซ้อม:\n"
                     f"- วันนี้วันที่: {today_str}\n"
                     f"- รายละเอียดตารางซ้อมวันนี้จาก Garmin Connect:\n{today_workout_detail_text}\n"
@@ -896,7 +895,7 @@ def handle_tomorrow_workout_report() -> str:
                 profile = get_athlete_profile()
                 profile_context = format_athlete_profile_summary(profile)
                 prompt = (
-                    f"คุณคือ Personal Running Coach มืออาชีพ\n"
+                    f"คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ\n"
                     f"ข้อมูลประกอบการวิเคราะห์:\n"
                     f"- วันนี้วันที่: {today_str}\n"
                     f"- กิจกรรมการซ้อมวันนี้: {today_activity_summary}\n"
@@ -1154,8 +1153,8 @@ def ask_gemini_coach(question: str) -> str:
     profile_summary = format_athlete_profile_summary(athlete_profile)
 
     system_prompt = (
-        "คุณคือ Personal Running Coach มืออาชีพ ให้คำปรึกษาแผนการซ้อมวิ่ง วิเคราะห์สมรรถภาพ และการดูแลร่างกาย "
-        "โดยอิงจากข้อมูลจริงจาก Garmin Connect และผลการทดสอบ Lactate Threshold (LT1, LT2) รวมถึงโซนหัวใจและเพซจริงของคุณพรเทพที่ให้มา\n"
+        "คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ ให้คำปรึกษาแผนการซ้อมวิ่ง วิเคราะห์สมรรถภาพ และการดูแลร่างกาย "
+        "โดยอิงจากข้อมูลจริงจาก Garmin Connect และผลการทดสอบ Lactate Threshold (LT1, LT2) รวมถึงโซนหัวใจและเพซจริงของนักกีฬาที่ให้มา\n"
         "กฎเหล็กสำคัญที่ต้องปฏิบัติตามอย่างเคร่งครัด:\n"
         "1. ตารางซ้อมในปฏิทิน Garmin (calendar_scheduled_workouts) คือแผนการซ้อมหลักที่ผู้ใช้กำหนดไว้ (Single Source of Truth) "
         "ห้ามคิดโปรแกรมใหม่ขึ้นมาขัดแย้งกับตารางเดิมเด็ดขาด หากในปฏิทินมีโปรแกรมอยู่แล้ว ให้แนะนำวิธีการปฏิบัติตามแผนนั้นให้สำเร็จอย่างปลอดภัย "
@@ -1164,11 +1163,11 @@ def ask_gemini_coach(question: str) -> str:
         "โดยระบุในคำตอบให้ชัดเจนว่าเป็นระยะสะสมที่นับตั้งแต่วันอาทิตย์เป็นต้นมา (ห้ามใช้วันจันทร์) "
         "และห้ามนำผลรวมของประวัติการวิ่งทั้งหมดมาเหมาว่าเป็นระยะสัปดาห์เด็ดขาด\n"
         "3. หากแผนซ้อมเป็น Easy Run หรือ Recovery: กำชับให้คุมเพซและ HR ให้อยู่ต่ำกว่า LT1 อย่างเคร่งครัด (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามแนะนำให้เร่งความเร็ว\n"
-        "4. กำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของคุณพรเทพอย่างเคร่งครัด\n"
+        "4. กำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของนักกีฬาอย่างเคร่งครัด\n"
         "5. คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE\n"
         "6. การวิเคราะห์สรุปผลการวิ่งวันนี้: หากผู้ใช้ถามถึงผลการวิ่ง หรือถามว่าวิ่งวันนี้เป็นอย่างไร หรือหนักไปเบาไปไหม "
         "ให้สรุปสถิติการวิ่ง และวิเคราะห์ฟันธงชัดเจนว่า 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' "
-        "โดยเปรียบเทียบ Pace และ Heart Rate กับจุดเกณฑ์แลคเตทของคุณพรเทพ (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
+        "โดยเปรียบเทียบ Pace และ Heart Rate กับจุดเกณฑ์แลคเตทของนักกีฬา (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
         "รวมถึงวิเคราะห์ผลกระทบต่อความพร้อมและแรงที่จะต้องใช้ซ้อมตามตารางวันถัดไปด้วยเสมอ"
     )
 
@@ -1378,7 +1377,7 @@ def generate_custom_training_plan(user_id: str, user_text: str) -> str:
     if athlete_profile:
         profile_prompt_part = f"\n{format_athlete_profile_summary(athlete_profile)}\n"
 
-    prompt = f"""คุณคือ Personal Running Coach มืออาชีพระดับโอลิมปิก
+    prompt = f"""คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ
 ภารกิจ: ออกแบบตารางซ้อมวิ่งแบบเฉพาะบุคคลใหม่ทั้งหมด ตั้งแต่วันที่ {start_date_str} ถึง {end_date_str} (รวม {total_days} วัน)
 เป้าหมายการแข่งขัน/ฝึกซ้อม: {target_goal}
 
@@ -1388,7 +1387,7 @@ def generate_custom_training_plan(user_id: str, user_text: str) -> str:
 
 หลักเกณฑ์การออกแบบตารางซ้อม:
 1. อิงหลักการฝึกซ้อม 80/20 (Easy Run 80% และ Quality Session เช่น Tempo/Interval/Long Run 20%)
-2. ใช้เกณฑ์เพซและโซนหัวใจจากผลทดสอบ Lactate ของคุณพรเทพอย่างเคร่งครัด:
+2. ใช้เกณฑ์เพซและโซนหัวใจจากผลทดสอบ Lactate ของนักกีฬาอย่างเคร่งครัด:
    - Easy Run / Recovery / Long Run: ต้องอยู่ต่ำกว่า LT1 (Pace 6:00 - 6:40 /km หรือช้ากว่า 6:40, HR 160-170 bpm หรือ < 172 bpm)
    - Steady Run: อยู่ระหว่าง LT1 และ LT2 (Pace 5:00 - 5:27 /km, HR 172-180 bpm)
    - Tempo / Threshold Run: อยู่ที่จุด LT2 (Pace 4:37 /km, HR 187 bpm)
