@@ -43,12 +43,12 @@ except ImportError:
     print("Error: garminconnect is not installed")
     sys.exit(1)
 
-# Garth SSO Consumer Preset (ป้องกัน Timeout บน Cloud/Render จาก AWS S3)
+# Garth SSO Consumer Preset (อัปเดตตรงกับ Garth S3 เพื่อให้ refresh_oauth2() ผ่านฉลุยบน Cloud)
 try:
     import garth.sso
     garth.sso.OAUTH_CONSUMER = {
-        "consumer_key": "fcad1b9b-81e8-495b-a24a-0a2c07cad970",
-        "consumer_secret": "E08UhVydFXcVOAnNsuDczEuELF6nlCdgiGk",
+        "consumer_key": "fc3e99d2-118c-44b8-8ae3-03370dde24c0",
+        "consumer_secret": "E08WAR897WEy2knn7aFBrvegVAf0AFdWBBF",
     }
 except Exception:
     pass
@@ -201,9 +201,23 @@ def get_garmin(force_refresh: bool = False):
                 auth_errors.append(f"Dir {p.name}: {e}")
                 print(f"[AUTH] Error loading from {p}: {e}")
 
-    detail = " | ".join(auth_errors) if auth_errors else "ไม่พบไฟล์ Token"
+    # 3. ลอง Login ด้วย Email/Password หากตั้งค่าไว้ใน Environment
+    garmin_email = os.getenv("GARMIN_EMAIL")
+    garmin_password = os.getenv("GARMIN_PASSWORD")
+    if garmin_email and garmin_password:
+        try:
+            print(f"[AUTH] Attempting fallback login via username/password for {garmin_email}...")
+            garmin.login(garmin_email, garmin_password)
+            _garmin_client = garmin
+            print(f"[AUTH] Successfully logged in via username/password!")
+            return _garmin_client
+        except Exception as e:
+            auth_errors.append(f"Credentials login: {e}")
+            print(f"[AUTH] Fallback login failed: {e}")
+
+    detail = " | ".join(auth_errors) if auth_errors else "ไม่พบไฟล์ Token หรือ Credential"
     raise RuntimeError(
-        f"ไม่สามารถโหลด Session Garmin ได้ ({detail}) กรุณาตรวจสอบหรืออัปเดตค่า GARMIN_TOKENS_BASE64 บน Render"
+        f"ไม่สามารถโหลด Session Garmin ได้ ({detail}) กรุณาตรวจสอบหรืออัปเดตค่า GARMIN_TOKENS_BASE64 หรือ GARMIN_EMAIL/GARMIN_PASSWORD บน Render"
     )
 
 
