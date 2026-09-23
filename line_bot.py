@@ -222,13 +222,28 @@ def get_garmin(force_refresh: bool = False):
     )
 
 
+def sanitize_line_message(text: str) -> str:
+    """ทำความสะอาดข้อความก่อนส่งไป LINE: ตัดคำว่า คุณพรเทพ / พรเทพ ออก"""
+    if not text:
+        return ""
+    cleaned = text.replace("ของคุณพรเทพ", "ของคุณ")
+    cleaned = cleaned.replace("ของคุณ Pornthep", "ของคุณ")
+    cleaned = cleaned.replace("คุณพรเทพ", "")
+    cleaned = cleaned.replace("คุณ Pornthep", "")
+    cleaned = cleaned.replace("คุณPornthep", "")
+    cleaned = cleaned.replace("Pornthep", "")
+    cleaned = re.sub(r"(?<![a-zA-Z0-9_])พรเทพ(?![a-zA-Z0-9_])", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    return cleaned.strip()
+
+
 def reply_line(reply_token: str, text: str):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=text.strip())],
+                messages=[TextMessage(text=sanitize_line_message(text))],
             )
         )
 
@@ -242,7 +257,7 @@ def push_line(to_user_id: str, text: str):
         line_bot_api.push_message(
             PushMessageRequest(
                 to=to_user_id,
-                messages=[TextMessage(text=text.strip())],
+                messages=[TextMessage(text=sanitize_line_message(text))],
             )
         )
     print(f"[PUSH] Sent daily notification to {to_user_id}")
@@ -369,7 +384,8 @@ def handle_today_summary() -> str:
                         f"{profile_summary}\n"
                         f"คำสั่ง: ให้วิเคราะห์ผลการวิ่งของวันนี้อย่างตรงไปตรงมา สั้น กระชับ (2-3 บรรทัด) โดยต้องระบุชัดเจนว่า:\n"
                         f"1. การวิ่งวันนี้ 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (ประเมินเปรียบเทียบจากเพซและอัตราการเต้นหัวใจเทียบกับจุด LT1 เพซ 5:27/HR 172 และ LT2 เพซ 4:37/HR 187)\n"
-                        f"2. ข้อแนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป"
+                        f"2. ข้อแนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป\n"
+                        f"3. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด ให้สื่อสารเนื้อหาโดยตรงอย่างมืออาชีพ"
                     )
                     run_analysis = call_gemini_with_fallback(client, prompt)
                 except Exception as ai_e:
@@ -450,7 +466,7 @@ def handle_show_lactate_profile() -> str:
     hr_zones = profile.get("heart_rate_device_zones", {})
 
     lines = [
-        f"🩸 ผลทดสอบ Lactate & โซนการซ้อม (คุณ{profile.get('athlete_name', 'พรเทพ')})",
+        "🩸 ผลทดสอบ Lactate & โซนการฝึกซ้อมเฉพาะบุคคล",
         "━━━━━━━━━━━━━━━━━━━",
         "🎯 จุดเกณฑ์เปลี่ยนแลคเตท (Lactate Thresholds):",
         f"• LT1 (แอโรบิกพื้นฐาน): เพซ {lt1.get('pace_min_km')} | HR {lt1.get('heart_rate_bpm')} bpm ({lt1.get('lactate_mmol')} mmol)",
@@ -745,6 +761,7 @@ def handle_daily_workout_report() -> str:
                     f"3. หากวันนี้เป็น Easy Run หรือ Recovery: กำชับให้คุมเพซและหัวใจให้อยู่ต่ำกว่า LT1 อย่างเคร่งครัด (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามแนะนำให้เร่งความเร็ว\n"
                     f"4. หาก Readiness ต่ำ หรือนอนน้อย: ให้แนะนำวิธีปรับความหนักเบา 'ภายใต้โปรแกรมเดิม' เช่น วิ่งที่ขอบช้าสุดของโซน (6:40 /km) หรือลดระยะทางเล็กน้อยเพื่อป้องกันอาการล้าสะสม\n"
                     f"5. คำนึงถึงโปรแกรมวันพรุ่งนี้/วันถัดไป เช่น หากพรุ่งนี้มีซ้อมหนัก วันนี้ต้องเน้นเก็บแรง\n"
+                    f"6. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด ให้สื่อสารเนื้อหาโดยตรงอย่างมืออาชีพ\n"
                     f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด):"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
@@ -910,6 +927,7 @@ def handle_tomorrow_workout_report() -> str:
                     f"3. หากพรุ่งนี้เป็น Easy Run: ย้ำการคุมเพซต่ำกว่า LT1 (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามสั่งเร่งความเร็ว\n"
                     f"4. หากพรุ่งนี้เป็น Tempo / Interval / ซ้อมหนัก: แนะนำการเตรียมตัวล่วงหน้าคืนนี้ (การนอน โภชนาการ น้ำดื่ม) และกำหนดเพซเป้าหมายตามผลแลคเตท (LT2: 4:37, Interval: < 4:17)\n"
                     f"5. วิเคราะห์เชื่อมโยงกับกิจกรรมและความล้าของวันนี้ เพื่อแนะนำการฟื้นฟูและการปรับตัว\n"
+                    f"6. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด ให้สื่อสารเนื้อหาโดยตรงอย่างมืออาชีพ\n"
                     f"ให้เขียนคำแนะนำเตรียมตัวสำหรับวันพรุ่งนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด):"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
@@ -1168,7 +1186,8 @@ def ask_gemini_coach(question: str) -> str:
         "6. การวิเคราะห์สรุปผลการวิ่งวันนี้: หากผู้ใช้ถามถึงผลการวิ่ง หรือถามว่าวิ่งวันนี้เป็นอย่างไร หรือหนักไปเบาไปไหม "
         "ให้สรุปสถิติการวิ่ง และวิเคราะห์ฟันธงชัดเจนว่า 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' "
         "โดยเปรียบเทียบ Pace และ Heart Rate กับจุดเกณฑ์แลคเตทของนักกีฬา (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
-        "รวมถึงวิเคราะห์ผลกระทบต่อความพร้อมและแรงที่จะต้องใช้ซ้อมตามตารางวันถัดไปด้วยเสมอ"
+        "รวมถึงวิเคราะห์ผลกระทบต่อความพร้อมและแรงที่จะต้องใช้ซ้อมตามตารางวันถัดไปด้วยเสมอ\n"
+        "7. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด ให้แนะนำและสื่อสารโดยตรงอย่างมืออาชีพ"
     )
 
     try:
@@ -1395,7 +1414,8 @@ def generate_custom_training_plan(user_id: str, user_text: str) -> str:
 3. คำนึงถึงสมรรถภาพจริง (VO2 Max, เพซ และ Training Readiness ปัจจุบัน)
 4. ต้องมีวันพัก (Rest Day) 1-2 วันต่อสัปดาห์เพื่อการฟื้นตัวอย่างมีประสิทธิภาพ
 5. ระบุระยะทาง (km), เพซเป้าหมาย (อิงตามเกณฑ์แลคเตทข้างต้น) และโครงสร้างการวิ่ง (Warmup, Main, Cooldown) ชัดเจน
-6. ตอบกลับเฉพาะโครงสร้าง JSON array ที่ถูกต้อง (Valid JSON array) เท่านั้น ห้ามใส่คำทักทายหรือ markdown code block อื่น นอกเหนือจาก JSON array:
+6. ห้ามระบุชื่อบุคคลในข้อมูลการซ้อมเด็ดขาด
+7. ตอบกลับเฉพาะโครงสร้าง JSON array ที่ถูกต้อง (Valid JSON array) เท่านั้น ห้ามใส่คำทักทายหรือ markdown code block อื่น นอกเหนือจาก JSON array:
 
 [
   {{
