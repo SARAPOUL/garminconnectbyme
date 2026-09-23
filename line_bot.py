@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 # FastAPI
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # LINE Bot SDK v3
 from linebot.v3 import WebhookHandler
@@ -1172,8 +1172,9 @@ async def on_startup():
 
 
 @app.get("/")
+@app.head("/")
 def index():
-    return {"status": "ok", "message": "Garmin LINE Bot Server is running"}
+    return PlainTextResponse("OK", status_code=200)
 
 
 def _run_morning_report_task(today_str: str):
@@ -1191,18 +1192,14 @@ def _run_morning_report_task(today_str: str):
 
 @app.get("/cron/daily-workout")
 @app.post("/cron/daily-workout")
+@app.head("/cron/daily-workout")
 def cron_daily_workout(background_tasks: BackgroundTasks):
     """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอน 8 โมงเช้า เพื่อปลุก Render"""
     tz_bkk = timezone(timedelta(hours=7))
     today_str = datetime.now(tz_bkk).date().isoformat()
 
     background_tasks.add_task(_run_morning_report_task, today_str)
-    return {
-        "status": "accepted",
-        "message": "Daily workout report task queued in background",
-        "date": today_str,
-        "recipient": LINE_ALLOWED_USER_ID,
-    }
+    return PlainTextResponse("OK", status_code=200)
 
 
 @app.post("/callback")
