@@ -273,6 +273,83 @@ def handle_today_summary() -> str:
         return f"❌ ไม่สามารถดึงข้อมูลสรุปได้: {e}"
 
 
+ATHLETE_PROFILE_FILE = PROJECT_DIR / "athlete_profile.json"
+
+
+def get_athlete_profile() -> dict:
+    """โหลดข้อมูลผลทดสอบ Lactate และโซนการฝึกซ้อมของนักกีฬา (เฉพาะ account คุณพรเทพ)"""
+    try:
+        if ATHLETE_PROFILE_FILE.exists():
+            with open(ATHLETE_PROFILE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[PROFILE] Failed to load athlete profile: {e}")
+    return {}
+
+
+def format_athlete_profile_summary(profile: dict) -> str:
+    """จัดรูปแบบข้อมูล Lactate Thresholds และ Training Zones เป็นข้อความสำหรับ AI Prompt"""
+    if not profile:
+        return ""
+    lt = profile.get("lactate_thresholds", {})
+    lt1 = lt.get("LT1", {})
+    lt2 = lt.get("LT2", {})
+    return (
+        f"[ข้อมูล Lactate Threshold & โซนการฝึกซ้อมเฉพาะบุคคลของคุณพรเทพ]:\n"
+        f"• LT1 (Aerobic Threshold): Pace {lt1.get('pace_min_km', '05:27')} / HR {lt1.get('heart_rate_bpm', 172)} bpm | Lactate {lt1.get('lactate_mmol', 1.6)} mmol\n"
+        f"• LT2 (Anaerobic / Threshold): Pace {lt2.get('pace_min_km', '04:37')} / HR {lt2.get('heart_rate_bpm', 187)} bpm | Lactate {lt2.get('lactate_mmol', 3.0)} mmol\n"
+        f"• Easy Run / Recovery / Long Run: Pace 6:00 - 6:40 /km (หรือช้ากว่า 6:40), HR 160 - 170 bpm (< 172 bpm)\n"
+        f"• Steady Run (ระหว่าง LT1-LT2): Pace 5:00 - 5:27 /km, HR 172 - 180 bpm\n"
+        f"• Tempo / Threshold Run (จุด LT2): Pace 4:37 /km, HR 187 bpm\n"
+        f"• High Intensity / Interval (เหนือ LT2): Pace < 4:17 /km, HR 192+ bpm\n"
+        f"• Device HR Zones: Z1 < 172, Z2 172-186, Z3 187-191, Z4 192-199, Z5 >= 200 bpm\n"
+    )
+
+
+def handle_show_lactate_profile() -> str:
+    """แสดงข้อมูลผลการทดสอบ Lactate และโซนการซ้อมของคุณพรเทพ"""
+    profile = get_athlete_profile()
+    if not profile:
+        return "❌ ไม่พบข้อมูลผลทดสอบ Lactate ในระบบ"
+
+    lt = profile.get("lactate_thresholds", {})
+    lt1 = lt.get("LT1", {})
+    lt2 = lt.get("LT2", {})
+    hr_zones = profile.get("heart_rate_device_zones", {})
+
+    lines = [
+        f"🩸 ผลทดสอบ Lactate & โซนการซ้อม (คุณ{profile.get('athlete_name', 'พรเทพ')})",
+        "━━━━━━━━━━━━━━━━━━━",
+        "🎯 จุดเกณฑ์เปลี่ยนแลคเตท (Lactate Thresholds):",
+        f"• LT1 (แอโรบิกพื้นฐาน): เพซ {lt1.get('pace_min_km')} | HR {lt1.get('heart_rate_bpm')} bpm ({lt1.get('lactate_mmol')} mmol)",
+        f"• LT2 (Threshold / Tempo): เพซ {lt2.get('pace_min_km')} | HR {lt2.get('heart_rate_bpm')} bpm ({lt2.get('lactate_mmol')} mmol)",
+        "",
+        "🏃 โซนซ้อมตามวัตถุประสงค์ (Training Zones):",
+        "1. Easy / Long Run (< LT1):",
+        "   - เพซ: 6:00 - 6:40 /km (Warmup ช้ากว่า 6:40)",
+        "   - HR: 160 - 170 bpm (< 172)",
+        "2. Steady Run (LT1 - LT2):",
+        "   - เพซ: 5:00 - 5:27 /km",
+        "   - HR: 172 - 180 bpm",
+        "3. Tempo / Threshold (ที่จุด LT2):",
+        "   - เพซ: 4:37 /km",
+        "   - HR: 187 bpm",
+        "4. High Intensity / Interval (> LT2):",
+        "   - เพซ: เร็วกว่า 4:17 /km",
+        "   - HR: 192+ bpm",
+        "",
+        "⌚ Heart Rate Zones บนนาฬิกา Garmin:",
+        f"• Z1 (Recovery): {hr_zones.get('zone_1', {}).get('range', '< 172 bpm')}",
+        f"• Z2 (Aerobic Base): {hr_zones.get('zone_2', {}).get('range', '172 - 186 bpm')}",
+        f"• Z3 (Threshold LT2): {hr_zones.get('zone_3', {}).get('range', '187 - 191 bpm')}",
+        f"• Z4 (High Intensity): {hr_zones.get('zone_4', {}).get('range', '192 - 199 bpm')}",
+        f"• Z5 (Maximal / VO2max): {hr_zones.get('zone_5', {}).get('range', '>= 200 bpm')}",
+        "━━━━━━━━━━━━━━━━━━━",
+        "💡 AI Coach ใช้ข้อมูลชุดนี้ในการวิเคราะห์และออกแบบตารางซ้อมเฉพาะบุคคลของคุณเสมอ",
+    ]
+    return "\n".join(lines)
+
+
 def call_gemini_with_fallback(client, prompt: str) -> str:
     """เรียกใช้ Gemini API พร้อมระบบ Fallback Model และ Retry เพื่อป้องกันปัญหา 503 Overload"""
     candidate_models = [
@@ -380,6 +457,8 @@ def handle_daily_workout_report() -> str:
         if GEMINI_API_KEY and genai:
             try:
                 client = genai.Client(api_key=GEMINI_API_KEY)
+                profile = get_athlete_profile()
+                profile_context = format_athlete_profile_summary(profile)
                 prompt = (
                     f"คุณคือ Personal Running Coach มืออาชีพ\n"
                     f"วันนี้วันที่: {today_str}\n"
@@ -388,8 +467,10 @@ def handle_daily_workout_report() -> str:
                     f"ความพร้อมร่างกายเช้านี้:\n"
                     f"- Training Readiness: {readiness_score} ({readiness_level})\n"
                     f"- การนอนหลับ: {sleep_text}\n\n"
+                    f"{profile_context}\n"
                     f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
-                    f"ประเมินว่าควรวิ่งตามแผนปกติ หรือควรระวัง/ปรับลดเรื่องใด (เช่น หาก Readiness ต่ำ หรือนอนน้อย ควรเน้นอะไร):"
+                    f"ประเมินร่วมกับโซนและเกณฑ์แลคเตทเฉพาะบุคคลของคุณพรเทพ (เช่น Easy เพซ 6:00-6:40 /km หรือ HR < 172, Steady 5:00-5:27, Tempo 4:37) "
+                    f"และประเมินว่าควรวิ่งตามแผนปกติ หรือควรระวัง/ปรับลดเรื่องใด (เช่น หาก Readiness ต่ำ หรือนอนน้อย ควรเน้นอะไร):"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
@@ -524,6 +605,8 @@ def handle_tomorrow_workout_report() -> str:
         if GEMINI_API_KEY and genai:
             try:
                 client = genai.Client(api_key=GEMINI_API_KEY)
+                profile = get_athlete_profile()
+                profile_context = format_athlete_profile_summary(profile)
                 prompt = (
                     f"คุณคือ Personal Running Coach มืออาชีพ\n"
                     f"ข้อมูลประกอบการวิเคราะห์:\n"
@@ -533,9 +616,9 @@ def handle_tomorrow_workout_report() -> str:
                     f"- วันพรุ่งนี้วันที่: {tomorrow_str}\n"
                     f"- แผนซ้อมวันพรุ่งนี้จาก Garmin: {tomorrow_workout.get('title') if tomorrow_workout else 'พักผ่อน (Rest Day)'}\n"
                     f"- รายละเอียดเป้าหมายพรุ่งนี้: {tomorrow_workout.get('description') if tomorrow_workout else 'ไม่มี'}\n\n"
+                    f"{profile_context}\n"
                     f"คำสั่ง: ให้วิเคราะห์ความเชื่อมโยงระหว่างการซ้อม/สภาพร่างกายของวันนี้ เพื่อให้คำแนะนำเตรียมตัวสำหรับวันพรุ่งนี้ "
-                    f"เขียนคำแนะนำแบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
-                    f"เช่น หากวันนี้ซ้อมหนัก คืนนี้และก่อนวิ่งพรุ่งนี้ควรฟื้นฟูอย่างไร หรือหากวันนี้พักผ่อนเต็มที่ พรุ่งนี้พร้อมซ้อมตามแผนระดับใด:"
+                    f"เขียนคำแนะนำแบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) โดยอิงตามเกณฑ์เพซและโซนหัวใจจากผล Lactate Test ของคุณพรเทพ:"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
@@ -712,17 +795,24 @@ def ask_gemini_coach(question: str) -> str:
     except Exception as e:
         context["fetch_note"] = f"บางส่วนของข้อมูล Garmin ไม่พร้อมใช้งาน: {e}"
 
+    athlete_profile = get_athlete_profile()
+    if athlete_profile:
+        context["athlete_lactate_profile"] = athlete_profile
+
+    profile_summary = format_athlete_profile_summary(athlete_profile)
+
     system_prompt = (
         "คุณคือ Personal Running Coach มืออาชีพ ให้คำปรึกษาแผนการซ้อมวิ่ง วิเคราะห์สมรรถภาพ และการดูแลร่างกาย "
-        "โดยอิงจากข้อมูลจริงจาก Garmin Connect ของผู้ใช้ที่ให้มา "
+        "โดยอิงจากข้อมูลจริงจาก Garmin Connect และผลการทดสอบ Lactate Threshold (LT1, LT2) รวมถึงโซนหัวใจและเพซจริงของคุณพรเทพที่ให้มา "
         "คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE "
-        "และกำหนด Pace หรือระยะทางโดยอิงจากสมรรถภาพปัจจุบันของผู้ใช้จริง"
+        "และกำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของคุณพรเทพอย่างเคร่งครัด"
     )
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
             f"{system_prompt}\n\n"
+            f"{profile_summary}\n\n"
             f"[ข้อมูล Garmin Connect ล่าสุดของผู้ใช้]:\n{context}\n\n"
             f"[คำถามจากผู้ใช้]: {question}\n\n"
             f"กรุณาตอบคำแนะนำอย่างเป็นมืออาชีพและกระชับ:"
@@ -919,19 +1009,30 @@ def generate_custom_training_plan(user_id: str, user_text: str) -> str:
     except Exception as e:
         context["note"] = f"ไม่สามารถดึงข้อมูล Garmin บางส่วนได้: {e}"
 
+    athlete_profile = get_athlete_profile()
+    profile_prompt_part = ""
+    if athlete_profile:
+        profile_prompt_part = f"\n{format_athlete_profile_summary(athlete_profile)}\n"
+
     prompt = f"""คุณคือ Personal Running Coach มืออาชีพระดับโอลิมปิก
 ภารกิจ: ออกแบบตารางซ้อมวิ่งแบบเฉพาะบุคคลใหม่ทั้งหมด ตั้งแต่วันที่ {start_date_str} ถึง {end_date_str} (รวม {total_days} วัน)
 เป้าหมายการแข่งขัน/ฝึกซ้อม: {target_goal}
 
+{profile_prompt_part}
 [ข้อมูลสมรรถภาพทางกายจริงจาก Garmin Connect]:
 {json.dumps(context, ensure_ascii=False, indent=2)}
 
 หลักเกณฑ์การออกแบบตารางซ้อม:
 1. อิงหลักการฝึกซ้อม 80/20 (Easy Run 80% และ Quality Session เช่น Tempo/Interval/Long Run 20%)
-2. คำนึงถึงสมรรถภาพจริง (VO2 Max, เพซ และ Training Readiness ปัจจุบัน)
-3. ต้องมีวันพัก (Rest Day) 1-2 วันต่อสัปดาห์เพื่อการฟื้นตัวอย่างมีประสิทธิภาพ
-4. ระบุระยะทาง (km), เพซเป้าหมาย (เช่น "6:00-6:20 /km") และโครงสร้างการวิ่ง (Warmup, Main, Cooldown) ชัดเจน
-5. ตอบกลับเฉพาะโครงสร้าง JSON array ที่ถูกต้อง (Valid JSON array) เท่านั้น ห้ามใส่คำทักทายหรือ markdown code block อื่น นอกเหนือจาก JSON array:
+2. ใช้เกณฑ์เพซและโซนหัวใจจากผลทดสอบ Lactate ของคุณพรเทพอย่างเคร่งครัด:
+   - Easy Run / Recovery / Long Run: ต้องอยู่ต่ำกว่า LT1 (Pace 6:00 - 6:40 /km หรือช้ากว่า 6:40, HR 160-170 bpm หรือ < 172 bpm)
+   - Steady Run: อยู่ระหว่าง LT1 และ LT2 (Pace 5:00 - 5:27 /km, HR 172-180 bpm)
+   - Tempo / Threshold Run: อยู่ที่จุด LT2 (Pace 4:37 /km, HR 187 bpm)
+   - Interval / VO2max: เร็วกว่า LT2 (Pace < 4:17 /km, HR 192+ bpm)
+3. คำนึงถึงสมรรถภาพจริง (VO2 Max, เพซ และ Training Readiness ปัจจุบัน)
+4. ต้องมีวันพัก (Rest Day) 1-2 วันต่อสัปดาห์เพื่อการฟื้นตัวอย่างมีประสิทธิภาพ
+5. ระบุระยะทาง (km), เพซเป้าหมาย (อิงตามเกณฑ์แลคเตทข้างต้น) และโครงสร้างการวิ่ง (Warmup, Main, Cooldown) ชัดเจน
+6. ตอบกลับเฉพาะโครงสร้าง JSON array ที่ถูกต้อง (Valid JSON array) เท่านั้น ห้ามใส่คำทักทายหรือ markdown code block อื่น นอกเหนือจาก JSON array:
 
 [
   {{
@@ -1380,7 +1481,24 @@ def handle_message(event):
         reply_line(event.reply_token, runs_res)
         return
 
-    # 12. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin)
+    # 12. เช็กคำสั่งดูข้อมูล Lactate Profile & โซนหัวใจ
+    if user_text.lower() in [
+        "โซนวิ่ง",
+        "โซนหัวใจ",
+        "แลคเตท",
+        "lactate",
+        "zone",
+        "zones",
+        "profile",
+        "ผลแลคเตท",
+        "lt1",
+        "lt2",
+    ]:
+        profile_res = handle_show_lactate_profile()
+        reply_line(event.reply_token, profile_res)
+        return
+
+    # 13. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin และ Lactate Profile)
     coach_reply = ask_gemini_coach(user_text)
     reply_line(event.reply_token, coach_reply)
 
