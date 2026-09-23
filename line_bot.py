@@ -418,6 +418,129 @@ def call_gemini_with_fallback(client, prompt: str) -> str:
     raise RuntimeError(f"All Gemini models failed: {last_err}")
 
 
+def format_speed_to_pace(val: float) -> str:
+    """แปลงความเร็ว m/s หรือ sec/km เป็นเพซ mm:ss /km"""
+    if not val or val <= 0:
+        return ""
+    if 1.0 <= val <= 10.0:
+        sec_per_km = 1000.0 / val
+    else:
+        sec_per_km = val
+    m, s = divmod(int(round(sec_per_km)), 60)
+    return f"{m}:{s:02d}"
+
+
+def parse_step(step: dict) -> str:
+    """แปลง Workout Step แต่ละขั้นเป็นข้อความภาษาไทยที่กระชับและเข้าใจง่าย"""
+    step_type_obj = step.get("stepType") or {}
+    type_key = step_type_obj.get("stepTypeKey", "")
+    type_name_map = {
+        "warmup": "วอร์มอัพ",
+        "cooldown": "คูลดาวน์",
+        "interval": "วิ่งหลัก",
+        "recovery": "พัก/ฟื้นตัว",
+        "rest": "พัก",
+    }
+    type_name = type_name_map.get(type_key, type_key or "ช่วงซ้อม")
+
+    cond_obj = step.get("endCondition") or {}
+    cond_key = cond_obj.get("conditionTypeKey", "")
+    cond_val = step.get("endConditionValue") or 0
+
+    dur_str = ""
+    if cond_key == "distance":
+        if cond_val >= 1000:
+            dur_str = f"{cond_val / 1000:.2f} km"
+        else:
+            dur_str = f"{int(cond_val)} m"
+    elif cond_key == "time":
+        m, s = divmod(int(cond_val), 60)
+        if m > 0 and s > 0:
+            dur_str = f"{m} นาที {s} วิ"
+        elif m > 0:
+            dur_str = f"{m} นาที"
+        else:
+            dur_str = f"{s} วิ"
+    elif cond_key == "lap.button":
+        dur_str = "จนกดปุ่ม Lap"
+
+    target_obj = step.get("targetType") or {}
+    target_key = target_obj.get("workoutTargetTypeKey", "")
+    target_str = ""
+    t1 = step.get("targetValueOne")
+    t2 = step.get("targetValueTwo")
+
+    if target_key in ("pace.zone", "speed.zone") and t1 and t2:
+        p1 = format_speed_to_pace(t1)
+        p2 = format_speed_to_pace(t2)
+        if p1 and p2:
+            paces = sorted([p1, p2])
+            target_str = f" [เพซ {paces[0]} - {paces[1]} /km]"
+        elif p1:
+            target_str = f" [เพซ {p1} /km]"
+    elif target_key == "heart.rate.zone":
+        if t1 and t2:
+            target_str = f" [HR {int(min(t1, t2))}-{int(max(t1, t2))} bpm]"
+        elif t1:
+            target_str = f" [HR {int(t1)} bpm]"
+
+    res = f"{type_name}"
+    if dur_str:
+        res += f" {dur_str}"
+    if target_str:
+        res += target_str
+    return res
+
+
+def summarize_workout_steps_short(detail: dict) -> str:
+    """สรุปขั้นตอนการซ้อมจาก workout detail เป็นประโยคสั้นๆ อ่านง่าย"""
+    if not detail or not isinstance(detail, dict):
+        return ""
+    segs = detail.get("workoutSegments", [])
+    if not segs:
+        return ""
+
+    parts = []
+    for seg in segs:
+        steps = seg.get("workoutSteps", [])
+        for step in steps:
+            step_type = step.get("type", "")
+            if step_type == "RepeatGroupDTO" or "numberOfIterations" in step:
+                iters = step.get("numberOfIterations", 1)
+                sub_steps = step.get("workoutSteps", [])
+                sub_strs = [parse_step(st) for st in sub_steps]
+                sub_combined = " ➔ ".join(sub_strs)
+                parts.append(f"{iters}x [{sub_combined}]")
+            else:
+                s_str = parse_step(step)
+                if s_str:
+                    parts.append(s_str)
+
+    return " ➔ ".join(parts)
+
+
+def summarize_workout_detail(workout_item: dict, detail: dict = None) -> str:
+    """สรุปข้อมูลการซ้อมครบถ้วนทั้งชื่อ รายละเอียด และขั้นตอนการซ้อมสำหรับ AI Prompt"""
+    if not workout_item:
+        return "พักผ่อน (Rest Day)"
+
+    title = workout_item.get("title", "วิ่ง")
+    desc = workout_item.get("description", "").strip()
+    if not desc and detail:
+        desc = detail.get("description", "").strip()
+
+    steps_summary = ""
+    if detail:
+        steps_summary = summarize_workout_steps_short(detail)
+
+    lines = [f"• ชื่อโปรแกรม: {title}"]
+    if desc:
+        lines.append(f"• คำอธิบาย/เป้าหมาย: {desc}")
+    if steps_summary:
+        lines.append(f"• ขั้นตอนการซ้อม (Steps): {steps_summary}")
+    return "\n".join(lines)
+
+
 def handle_daily_workout_report() -> str:
     """สร้างรายงานตารางซ้อมล่วงหน้า + คำแนะนำของวันนั้นจริงแบบสั้นๆ"""
     try:
@@ -449,13 +572,28 @@ def handle_daily_workout_report() -> str:
                     try:
                         detail = garmin.connectapi(f"/workout-service/workout/{wid}")
                         i["description"] = detail.get("description", "").strip()
+                        i["detail"] = detail
                     except Exception:
                         i["description"] = ""
+                        i["detail"] = None
                     upcoming.append(i)
                     if i.get("date") == today_str and not today_workout:
                         today_workout = i
 
         upcoming.sort(key=lambda x: x.get("date"))
+
+        today_detail = today_workout.get("detail") if today_workout else None
+        today_workout_detail_text = summarize_workout_detail(today_workout, today_detail)
+        today_steps_short = summarize_workout_steps_short(today_detail) if today_detail else ""
+
+        # ตารางซ้อมวันอื่นๆ ในสัปดาห์ เพื่อให้ AI เข้าใจบริบทภาพรวม
+        weekly_summary_items = []
+        for w in upcoming:
+            w_d = w.get("date", "")
+            if w_d != today_str:
+                w_title = w.get("title", "Run")
+                weekly_summary_items.append(f"{w_d}: {w_title}")
+        weekly_context_str = ", ".join(weekly_summary_items) if weekly_summary_items else "ไม่มีรายการซ้อมอื่นใน 7 วันนี้"
 
         # 2. ดึงสถานะความพร้อมวันนี้
         readiness_score = "-"
@@ -482,7 +620,7 @@ def handle_daily_workout_report() -> str:
         except Exception:
             pass
 
-        # 3. สร้างคำแนะนำโค้ช AI สั้นๆ จาก Gemini
+        # 3. สร้างคำแนะนำโค้ช AI สั้นๆ จาก Gemini โดยอิงจากตารางซ้อมจริง
         advice = "พร้อมสำหรับการซ้อมวันนี้ คุมเพซตามแผนที่กำหนด"
         if GEMINI_API_KEY and genai:
             try:
@@ -491,16 +629,21 @@ def handle_daily_workout_report() -> str:
                 profile_context = format_athlete_profile_summary(profile)
                 prompt = (
                     f"คุณคือ Personal Running Coach มืออาชีพ\n"
-                    f"วันนี้วันที่: {today_str}\n"
-                    f"แผนซ้อมวันนี้จาก Garmin: {today_workout.get('title') if today_workout else 'พักผ่อน (Rest Day)'}\n"
-                    f"รายละเอียดเป้าหมายเพซ/ระยะ: {today_workout.get('description') if today_workout else 'ไม่มี'}\n"
-                    f"ความพร้อมร่างกายเช้านี้:\n"
-                    f"- Training Readiness: {readiness_score} ({readiness_level})\n"
-                    f"- การนอนหลับ: {sleep_text}\n\n"
+                    f"บริบทวันที่และตารางซ้อม:\n"
+                    f"- วันนี้วันที่: {today_str}\n"
+                    f"- รายละเอียดตารางซ้อมวันนี้จาก Garmin Connect:\n{today_workout_detail_text}\n"
+                    f"- ตารางซ้อมวันอื่นๆ ในสัปดาห์นี้: {weekly_context_str}\n"
+                    f"- สภาพร่างกายเช้านี้:\n"
+                    f"  • Training Readiness: {readiness_score} ({readiness_level})\n"
+                    f"  • การนอนหลับ: {sleep_text}\n\n"
                     f"{profile_context}\n"
-                    f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) "
-                    f"ประเมินร่วมกับโซนและเกณฑ์แลคเตทเฉพาะบุคคลของคุณพรเทพ (เช่น Easy เพซ 6:00-6:40 /km หรือ HR < 172, Steady 5:00-5:27, Tempo 4:37) "
-                    f"และประเมินว่าควรวิ่งตามแผนปกติ หรือควรระวัง/ปรับลดเรื่องใด (เช่น หาก Readiness ต่ำ หรือนอนน้อย ควรเน้นอะไร):"
+                    f"กฎสำคัญในการให้คำแนะนำ:\n"
+                    f"1. ตารางซ้อมใน Garmin คือ Single Source of Truth ห้ามเปลี่ยนโปรแกรมหรือเปลี่ยนประเภทการซ้อมเด็ดขาด\n"
+                    f"2. หากวันนี้เป็น Rest Day หรือไม่มีแผนวิ่ง: ห้ามสั่งให้ไปวิ่งเด็ดขาด ให้แนะนำการฟื้นฟู ยืดเหยียด หรือพักผ่อน\n"
+                    f"3. หากวันนี้เป็น Easy Run หรือ Recovery: กำชับให้คุมเพซและหัวใจให้อยู่ต่ำกว่า LT1 อย่างเคร่งครัด (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามแนะนำให้เร่งความเร็ว\n"
+                    f"4. หาก Readiness ต่ำ หรือนอนน้อย: ให้แนะนำวิธีปรับความหนักเบา 'ภายใต้โปรแกรมเดิม' เช่น วิ่งที่ขอบช้าสุดของโซน (6:40 /km) หรือลดระยะทางเล็กน้อยเพื่อป้องกันอาการล้าสะสม\n"
+                    f"5. คำนึงถึงโปรแกรมวันพรุ่งนี้/วันถัดไป เช่น หากพรุ่งนี้มีซ้อมหนัก วันนี้ต้องเน้นเก็บแรง\n"
+                    f"ให้เขียนคำแนะนำการซ้อมสำหรับวันนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด):"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
@@ -512,7 +655,8 @@ def handle_daily_workout_report() -> str:
         if today_workout:
             desc = today_workout.get("description", "").strip()
             desc_str = f"\n  เป้าหมาย: {desc}" if desc else ""
-            today_info = f"🏃 {today_workout.get('title')}{desc_str}"
+            steps_str = f"\n  ขั้นตอน: {today_steps_short}" if today_steps_short else ""
+            today_info = f"🏃 {today_workout.get('title')}{desc_str}{steps_str}"
 
         lines = [
             f"☀️ ตารางซ้อม & ความพร้อมวันนี้ ({today_str})",
@@ -561,16 +705,27 @@ def handle_tomorrow_workout_report() -> str:
                 pass
 
         tomorrow_workout = None
+        upcoming_after = []
         for i in items:
-            if i.get("itemType") == "workout" and i.get("date") == tomorrow_str:
-                wid = i.get("workoutId")
-                try:
-                    detail = garmin.connectapi(f"/workout-service/workout/{wid}")
-                    i["description"] = detail.get("description", "").strip()
-                except Exception:
-                    i["description"] = ""
-                tomorrow_workout = i
-                break
+            if i.get("itemType") == "workout":
+                w_d = i.get("date", "")
+                if w_d == tomorrow_str and not tomorrow_workout:
+                    wid = i.get("workoutId")
+                    try:
+                        detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                        i["description"] = detail.get("description", "").strip()
+                        i["detail"] = detail
+                    except Exception:
+                        i["description"] = ""
+                        i["detail"] = None
+                    tomorrow_workout = i
+                elif tomorrow_str < w_d <= end_date.isoformat():
+                    upcoming_after.append(f"{w_d}: {i.get('title', 'Run')}")
+
+        tomorrow_detail = tomorrow_workout.get("detail") if tomorrow_workout else None
+        tomorrow_workout_detail_text = summarize_workout_detail(tomorrow_workout, tomorrow_detail)
+        tomorrow_steps_short = summarize_workout_steps_short(tomorrow_detail) if tomorrow_detail else ""
+        upcoming_context_str = ", ".join(upcoming_after[:3]) if upcoming_after else "ไม่มี"
 
         # 2. ดึงข้อมูลการซ้อมและกิจกรรมของ วันนี้ หรือ วันก่อนหน้า
         activities = []
@@ -644,11 +799,16 @@ def handle_tomorrow_workout_report() -> str:
                     f"- กิจกรรมการซ้อมวันนี้: {today_activity_summary}\n"
                     f"- สภาพร่างกายปัจจุบัน: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
                     f"- วันพรุ่งนี้วันที่: {tomorrow_str}\n"
-                    f"- แผนซ้อมวันพรุ่งนี้จาก Garmin: {tomorrow_workout.get('title') if tomorrow_workout else 'พักผ่อน (Rest Day)'}\n"
-                    f"- รายละเอียดเป้าหมายพรุ่งนี้: {tomorrow_workout.get('description') if tomorrow_workout else 'ไม่มี'}\n\n"
+                    f"- รายละเอียดตารางซ้อมวันพรุ่งนี้จาก Garmin Connect:\n{tomorrow_workout_detail_text}\n"
+                    f"- รายการซ้อมถัดไปในสัปดาห์: {upcoming_context_str}\n\n"
                     f"{profile_context}\n"
-                    f"คำสั่ง: ให้วิเคราะห์ความเชื่อมโยงระหว่างการซ้อม/สภาพร่างกายของวันนี้ เพื่อให้คำแนะนำเตรียมตัวสำหรับวันพรุ่งนี้ "
-                    f"เขียนคำแนะนำแบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด) โดยอิงตามเกณฑ์เพซและโซนหัวใจจากผล Lactate Test ของคุณพรเทพ:"
+                    f"กฎสำคัญในการให้คำแนะนำ:\n"
+                    f"1. แผนซ้อมวันพรุ่งนี้ที่กำหนดใน Garmin คือ Single Source of Truth ห้ามเปลี่ยนโปรแกรมหรือประเภทการซ้อมเด็ดขาด\n"
+                    f"2. หากพรุ่งนี้เป็น Rest Day หรือไม่มีแผนวิ่ง: แนะนำการพักผ่อนคืนนี้และวันพรุ่งนี้ ห้ามสั่งให้วิ่ง\n"
+                    f"3. หากพรุ่งนี้เป็น Easy Run: ย้ำการคุมเพซต่ำกว่า LT1 (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามสั่งเร่งความเร็ว\n"
+                    f"4. หากพรุ่งนี้เป็น Tempo / Interval / ซ้อมหนัก: แนะนำการเตรียมตัวล่วงหน้าคืนนี้ (การนอน โภชนาการ น้ำดื่ม) และกำหนดเพซเป้าหมายตามผลแลคเตท (LT2: 4:37, Interval: < 4:17)\n"
+                    f"5. วิเคราะห์เชื่อมโยงกับกิจกรรมและความล้าของวันนี้ เพื่อแนะนำการฟื้นฟูและการปรับตัว\n"
+                    f"ให้เขียนคำแนะนำเตรียมตัวสำหรับวันพรุ่งนี้แบบสั้น กระชับ ตรงประเด็น (ความยาว 2-3 บรรทัด):"
                 )
                 advice = call_gemini_with_fallback(client, prompt)
             except Exception as e:
@@ -659,7 +819,8 @@ def handle_tomorrow_workout_report() -> str:
         if tomorrow_workout:
             desc = tomorrow_workout.get("description", "").strip()
             desc_str = f"\n  เป้าหมาย: {desc}" if desc else ""
-            tomorrow_info = f"🏃 {tomorrow_workout.get('title')}{desc_str}"
+            steps_str = f"\n  ขั้นตอน: {tomorrow_steps_short}" if tomorrow_steps_short else ""
+            tomorrow_info = f"🏃 {tomorrow_workout.get('title')}{desc_str}{steps_str}"
 
         lines = [
             f"🌅 แผนการซ้อมวันพรุ่งนี้ ({tomorrow_str})",
@@ -788,7 +949,12 @@ def ask_gemini_coach(question: str) -> str:
         )
 
     context = {}
-    today = date.today().isoformat()
+    tz_bkk = timezone(timedelta(hours=7))
+    today_date = datetime.now(tz_bkk).date()
+    today = today_date.isoformat()
+    tomorrow_date = today_date + timedelta(days=1)
+    tomorrow_str = tomorrow_date.isoformat()
+
     try:
         garmin = get_garmin()
         context["today_summary"] = garmin.get_user_summary(today)
@@ -796,12 +962,23 @@ def ask_gemini_coach(question: str) -> str:
         context["training_readiness"] = garmin.get_training_readiness(today)
         context["vo2max"] = garmin.get_max_metrics(today)
 
+        # 1. ข้อมูลกิจกรรมการวิ่งและระยะสะสมจริง (คำนวณตามสัปดาห์ ไม่รวมกิจกรรมทั้งหมด)
         acts = garmin.get_activities(0, 20)
         running_acts = [
             a for a in acts
             if "run" in a.get("activityType", {}).get("typeKey", "").lower()
         ]
-        total_km = sum(a.get("distance", 0) for a in running_acts) / 1000
+
+        start_of_week = today_date - timedelta(days=today_date.weekday())
+        start_of_week_str = start_of_week.isoformat()
+        seven_days_ago_str = (today_date - timedelta(days=7)).isoformat()
+
+        this_week_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) >= start_of_week_str]
+        this_week_km = sum((a.get("distance") or 0) for a in this_week_runs) / 1000.0
+
+        past_7d_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) >= seven_days_ago_str]
+        past_7d_km = sum((a.get("distance") or 0) for a in past_7d_runs) / 1000.0
+
         recent_summaries = []
         for a in running_acts[:5]:
             dist = (a.get("distance") or 0) / 1000
@@ -818,10 +995,49 @@ def ask_gemini_coach(question: str) -> str:
                 "pace": pace,
                 "avg_hr": a.get("averageHR")
             })
-        context["running_history"] = {
-            "total_recent_km": round(total_km, 2),
-            "recent_runs": recent_summaries
+        context["running_mileage_stats"] = {
+            "this_week_km_since_monday": round(this_week_km, 2),
+            "past_7_days_total_km": round(past_7d_km, 2),
+            "recent_5_runs": recent_summaries
         }
+
+        # 2. ดึงตารางซ้อมในปฏิทิน Garmin สัปดาห์นี้ เพื่อใช้เป็น Single Source of Truth
+        try:
+            cal = garmin.connectapi(f"/calendar-service/year/{today_date.year}/month/{today_date.month - 1}")
+            items = cal.get("calendarItems", [])
+            end_date = today_date + timedelta(days=7)
+            if end_date.month != today_date.month:
+                try:
+                    cal2 = garmin.connectapi(f"/calendar-service/year/{end_date.year}/month/{end_date.month - 1}")
+                    items.extend(cal2.get("calendarItems", []))
+                except Exception:
+                    pass
+            scheduled_list = []
+            for i in items:
+                if i.get("itemType") == "workout":
+                    w_d = i.get("date", "")
+                    if today <= w_d <= end_date.isoformat():
+                        wid = i.get("workoutId")
+                        w_detail = None
+                        try:
+                            w_detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                        except Exception:
+                            pass
+                        tag = ""
+                        if w_d == today:
+                            tag = " [วันนี้]"
+                        elif w_d == tomorrow_str:
+                            tag = " [พรุ่งนี้]"
+                        scheduled_list.append({
+                            "date": f"{w_d}{tag}",
+                            "title": i.get("title", "Run"),
+                            "detail": summarize_workout_detail(i, w_detail)
+                        })
+            scheduled_list.sort(key=lambda x: x.get("date"))
+            context["calendar_scheduled_workouts"] = scheduled_list if scheduled_list else "ไม่มีตารางซ้อมที่ตั้งไว้ในปฏิทิน 7 วันนี้ (ถือเป็นวันพักผ่อนตามอัธยาศัย)"
+        except Exception as e:
+            context["calendar_scheduled_workouts_note"] = f"ไม่สามารถดึงตารางได้: {e}"
+
     except Exception as e:
         context["fetch_note"] = f"บางส่วนของข้อมูล Garmin ไม่พร้อมใช้งาน: {e}"
 
@@ -833,9 +1049,16 @@ def ask_gemini_coach(question: str) -> str:
 
     system_prompt = (
         "คุณคือ Personal Running Coach มืออาชีพ ให้คำปรึกษาแผนการซ้อมวิ่ง วิเคราะห์สมรรถภาพ และการดูแลร่างกาย "
-        "โดยอิงจากข้อมูลจริงจาก Garmin Connect และผลการทดสอบ Lactate Threshold (LT1, LT2) รวมถึงโซนหัวใจและเพซจริงของคุณพรเทพที่ให้มา "
-        "คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE "
-        "และกำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของคุณพรเทพอย่างเคร่งครัด"
+        "โดยอิงจากข้อมูลจริงจาก Garmin Connect และผลการทดสอบ Lactate Threshold (LT1, LT2) รวมถึงโซนหัวใจและเพซจริงของคุณพรเทพที่ให้มา\n"
+        "กฎเหล็กสำคัญที่ต้องปฏิบัติตามอย่างเคร่งครัด:\n"
+        "1. ตารางซ้อมในปฏิทิน Garmin (calendar_scheduled_workouts) คือแผนการซ้อมหลักที่ผู้ใช้กำหนดไว้ (Single Source of Truth) "
+        "ห้ามคิดโปรแกรมใหม่ขึ้นมาขัดแย้งกับตารางเดิมเด็ดขาด หากในปฏิทินมีโปรแกรมอยู่แล้ว ให้แนะนำวิธีการปฏิบัติตามแผนนั้นให้สำเร็จอย่างปลอดภัย "
+        "หรือหากในปฏิทินเป็น Rest Day หรือไม่มีแผนวิ่ง ห้ามสั่งให้ไปวิ่งเด็ดขาด ให้แนะนำการฟื้นฟู ยืดเหยียด หรือพักผ่อน\n"
+        "2. ห้ามสับสนระยะวิ่งสะสม: หากจะพูดถึงระยะสะสมรอบสัปดาห์ ให้อ้างอิงจาก 'this_week_km_since_monday' หรือ 'past_7_days_total_km' เท่านั้น "
+        "ห้ามนำผลรวมของประวัติการวิ่ง 20 รายการย้อนหลังมาเหมาว่าเป็นระยะสัปดาห์เด็ดขาด\n"
+        "3. หากแผนซ้อมเป็น Easy Run หรือ Recovery: กำชับให้คุมเพซและ HR ให้อยู่ต่ำกว่า LT1 อย่างเคร่งครัด (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามแนะนำให้เร่งความเร็ว\n"
+        "4. กำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของคุณพรเทพอย่างเคร่งครัด\n"
+        "5. คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE"
     )
 
     try:
@@ -1471,6 +1694,9 @@ def handle_message(event):
         "พรุ่งนี้วิ่งอะไร",
         "พน วิ่งอะไร",
         "พน.วิ่งอะไร",
+        "คำแนะนำพรุ่งนี้",
+        "แนะนำพรุ่งนี้",
+        "พรุ่งนี้ควรวิ่งยังไง",
         "tomorrow workout",
     ]
     if any(k in user_text.lower() for k in tomorrow_workout_triggers):
@@ -1489,6 +1715,14 @@ def handle_message(event):
         "ตารางซ้อม",
         "ซ้อมอะไร",
         "วิ่งอะไร",
+        "คำแนะนำวันนี้",
+        "คำแนะนำการซ้อม",
+        "แนะนำวันนี้",
+        "คำแนะนำ",
+        "วันนี้ควรวิ่งยังไง",
+        "วันนี้ควรซ้อมยังไง",
+        "ตารางซ้อมวันนี้",
+        "โค้ชวันนี้",
         "workout",
         "workouts",
         "plan",

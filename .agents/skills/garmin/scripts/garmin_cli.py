@@ -246,6 +246,47 @@ def get_activities_list(client, count=10):
         sys.exit(1)
 
 
+def get_upcoming_workouts(client, days=7):
+    try:
+        today = date.today()
+        today_str = today.isoformat()
+        end_date = today + timedelta(days=days)
+
+        cal1 = client.connectapi(f"/calendar-service/year/{today.year}/month/{today.month - 1}")
+        items = cal1.get("calendarItems", [])
+        if end_date.month != today.month:
+            try:
+                cal2 = client.connectapi(f"/calendar-service/year/{end_date.year}/month/{end_date.month - 1}")
+                items.extend(cal2.get("calendarItems", []))
+            except Exception:
+                pass
+
+        seen = set()
+        workouts = []
+        for i in items:
+            if i.get("itemType") == "workout" and today_str <= i.get("date", "") <= end_date.isoformat():
+                wid = i.get("workoutId")
+                if wid and wid not in seen:
+                    seen.add(wid)
+                    try:
+                        detail = client.connectapi(f"/workout-service/workout/{wid}")
+                        i["description"] = detail.get("description", "").strip()
+                    except Exception:
+                        i["description"] = ""
+                    workouts.append({
+                        "date": i.get("date"),
+                        "title": i.get("title"),
+                        "description": i.get("description"),
+                        "workoutId": wid
+                    })
+
+        workouts.sort(key=lambda x: x.get("date"))
+        print(json.dumps({"workouts": workouts}, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": f"Failed to fetch workouts: {e}"}, ensure_ascii=False))
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Garmin Skill CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -256,6 +297,10 @@ def main():
     # Subcommand: activities
     act_parser = subparsers.add_parser("activities", help="Get recent activities")
     act_parser.add_argument("--count", type=int, default=10, help="Number of activities to fetch")
+
+    # Subcommand: workouts
+    wo_parser = subparsers.add_parser("workouts", help="Get scheduled workouts")
+    wo_parser.add_argument("--days", type=int, default=7, help="Number of upcoming days to check")
 
     # Subcommand: weight
     weight_parser = subparsers.add_parser("weight", help="Log weight in kg")
@@ -268,6 +313,8 @@ def main():
         get_today_summary(client)
     elif args.command == "activities":
         get_activities_list(client, count=args.count)
+    elif args.command == "workouts":
+        get_upcoming_workouts(client, days=args.days)
     elif args.command == "weight":
         add_weight(client, args.value)
 
