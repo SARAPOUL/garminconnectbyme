@@ -386,7 +386,7 @@ def handle_today_summary() -> str:
         lines.append("")
 
         if run_analysis:
-            lines.append("💡 การประเมินจากโค้ช AI (หนักไป/เบาไป):")
+            lines.append("💡 การประเมินจากโค้ช AI:")
             lines.append(run_analysis)
             lines.append("")
 
