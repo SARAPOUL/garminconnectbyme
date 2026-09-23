@@ -91,6 +91,36 @@ app = FastAPI(title="Garmin LINE Bot")
 # Cache Garmin Client
 _garmin_client = None
 _last_daily_push_date = None
+_SERVER_START_TIME = datetime.now(timezone(timedelta(hours=7)))
+
+
+def handle_server_uptime() -> str:
+    tz_bkk = timezone(timedelta(hours=7))
+    now = datetime.now(tz_bkk)
+    diff = now - _SERVER_START_TIME
+    total_seconds = int(diff.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} วัน")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours} ชั่วโมง")
+    parts.append(f"{minutes} นาที {seconds} วินาที")
+    uptime_str = " ".join(parts)
+
+    lines = [
+        "🖥️ สถานะการทำงานของเซิร์ฟเวอร์ (Render)",
+        "━━━━━━━━━━━━━━━━━━━",
+        "🟢 สถานะ: กำลังทำงาน (Online / Live)",
+        f"⏱️ ทำงานต่อเนื่องมาแล้ว: {uptime_str}",
+        f"🚀 เริ่มสตาร์ตเมื่อ: {_SERVER_START_TIME.strftime('%d/%m/%Y %H:%M:%S')} (เวลาไทย)",
+        "━━━━━━━━━━━━━━━━━━━",
+        "💡 โควตา Free Tier ของ Render มี 750 ชั่วโมง/เดือน",
+    ]
+    return "\n".join(lines)
 
 
 def get_garmin(force_refresh: bool = False):
@@ -1278,6 +1308,12 @@ def index():
     return PlainTextResponse("OK", status_code=200)
 
 
+@app.get("/uptime")
+@app.head("/uptime")
+def uptime_endpoint():
+    return PlainTextResponse(handle_server_uptime(), status_code=200)
+
+
 def _run_morning_report_task(today_str: str):
     global _last_daily_push_date
     try:
@@ -1498,7 +1534,21 @@ def handle_message(event):
         reply_line(event.reply_token, profile_res)
         return
 
-    # 13. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin และ Lactate Profile)
+    # 13. เช็กคำสั่งดูสถานะ Uptime ของเซิร์ฟเวอร์
+    if user_text.lower() in [
+        "uptime",
+        "สถานะเซิร์ฟเวอร์",
+        "เซิร์ฟเวอร์",
+        "server",
+        "render",
+        "บอททำงานกี่ชม",
+        "รันมากี่ชม",
+    ]:
+        uptime_res = handle_server_uptime()
+        reply_line(event.reply_token, uptime_res)
+        return
+
+    # 14. ถามคำถามทั่วไป (Gemini Coach วิเคราะห์ร่วมกับข้อมูล Garmin และ Lactate Profile)
     coach_reply = ask_gemini_coach(user_text)
     reply_line(event.reply_token, coach_reply)
 
