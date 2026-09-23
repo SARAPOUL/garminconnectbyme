@@ -207,8 +207,9 @@ def get_garmin(force_refresh: bool = False):
     if garmin_email and garmin_password:
         try:
             print(f"[AUTH] Attempting fallback login via username/password for {garmin_email}...")
-            garmin.login(garmin_email, garmin_password)
-            _garmin_client = garmin
+            cred_garmin = Garmin(garmin_email, garmin_password)
+            cred_garmin.login()
+            _garmin_client = cred_garmin
             print(f"[AUTH] Successfully logged in via username/password!")
             return _garmin_client
         except Exception as e:
