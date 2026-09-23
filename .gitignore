@@ -6,5 +6,7 @@ __pycache__/
 venv/
 .venv/
 dumped_token.txt
+*dumped_token*.txt
+GEMINI.md
 *.token
 latest_draft_plan.json

@@ -271,9 +271,12 @@ def handle_record_weight(user_text: str) -> str:
 def handle_today_summary() -> str:
     try:
         garmin = get_garmin()
-        today = date.today().isoformat()
-        summary = garmin.get_user_summary(today)
+        tz_bkk = timezone(timedelta(hours=7))
+        today_date = datetime.now(tz_bkk).date()
+        today = today_date.isoformat()
 
+        # 1. ดึงข้อมูลสุขภาพทั่วไป
+        summary = garmin.get_user_summary(today)
         steps = summary.get("totalSteps", 0)
         step_goal = summary.get("dailyStepGoal", 0)
         distance_km = (summary.get("totalDistanceMeters") or 0) / 1000
@@ -293,27 +296,112 @@ def handle_today_summary() -> str:
         except Exception:
             pass
 
-        readiness_text = "-"
+        readiness_score = "-"
+        readiness_level = "-"
         try:
             r = garmin.get_training_readiness(today)
             if isinstance(r, list) and r:
-                readiness_text = f"{r[0].get('score', '-')} ({r[0].get('level', '')})"
+                readiness_score = r[0].get("score", "-")
+                readiness_level = r[0].get("level", "-")
             elif isinstance(r, dict):
-                readiness_text = f"{r.get('score', '-')} ({r.get('level', '')})"
+                readiness_score = r.get("score", "-")
+                readiness_level = r.get("level", "-")
         except Exception:
             pass
 
-        return (
-            f"📊 สรุปข้อมูลสุขภาพประจำวัน ({today})\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🚶 จำนวนก้าว: {steps:,} / {step_goal:,} ก้าว\n"
-            f"📍 ระยะทางรวม: {distance_km:.2f} km\n"
-            f"🔥 แคลอรี: {calories:,} kcal\n"
-            f"❤️ Resting HR: {resting_hr} bpm\n"
-            f"😴 การนอนหลับ: {sleep_text}\n"
-            f"⚡ ความเครียดเฉลี่ย: {stress}\n"
-            f"🎯 Training Readiness: {readiness_text}"
-        )
+        # 2. ดึงประวัติกิจกรรมการวิ่ง และคำนวณระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์)
+        activities = []
+        try:
+            activities = garmin.get_activities(0, 20)
+        except Exception:
+            pass
+
+        running_acts = [
+            a for a in activities
+            if "run" in a.get("activityType", {}).get("typeKey", "").lower()
+        ]
+
+        days_since_sunday = (today_date.weekday() + 1) % 7
+        start_of_week = today_date - timedelta(days=days_since_sunday)
+        start_of_week_str = start_of_week.isoformat()
+
+        this_week_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) >= start_of_week_str]
+        this_week_km = sum((a.get("distance") or 0) for a in this_week_runs) / 1000.0
+
+        today_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) == today]
+
+        # 3. สรุปผลการวิ่งของวันนี้และวิเคราะห์ว่า หนักไปไหม หรือ เบาไปไหม
+        run_analysis = ""
+        today_run_lines = []
+        if today_runs:
+            today_run_lines.append("🏃 กิจกรรมการวิ่งวันนี้:")
+            for a in today_runs:
+                name = a.get("activityName", "Running")
+                dist = (a.get("distance") or 0) / 1000
+                dur = (a.get("duration") or 0) / 60
+                speed = a.get("averageSpeed", 0)
+                pace_str = "N/A"
+                if speed > 0:
+                    p_min, p_sec = divmod(int(1000 / speed), 60)
+                    pace_str = f"{p_min}:{p_sec:02d} /km"
+                avg_hr = a.get("averageHR", "-")
+                max_hr = a.get("maxHR", "-")
+                aerobic_te = a.get("aerobicTrainingEffect", "-")
+                anaerobic_te = a.get("anaerobicTrainingEffect", "-")
+                today_run_lines.append(
+                    f"• {name}: {dist:.2f} km ({dur:.0f} นาที)\n"
+                    f"  - เพซเฉลี่ย: {pace_str} | HR เฉลี่ย: {avg_hr} bpm (สูงสุด: {max_hr} bpm)\n"
+                    f"  - Training Effect: Aerobic {aerobic_te} | Anaerobic {anaerobic_te}"
+                )
+
+            # ให้ AI ช่วยวิเคราะห์ผลการวิ่งว่าหนักไปหรือเบาไปไหม
+            if GEMINI_API_KEY and genai:
+                try:
+                    client = genai.Client(api_key=GEMINI_API_KEY)
+                    profile = get_athlete_profile()
+                    profile_summary = format_athlete_profile_summary(profile)
+                    prompt = (
+                        f"คุณคือ Personal Running Coach มืออาชีพ\n"
+                        f"นักวิ่ง: คุณพรเทพ\n"
+                        f"วันที่: {today}\n"
+                        f"ข้อมูลการวิ่งวันนี้:\n" + "\n".join(today_run_lines) + "\n\n"
+                        f"ความพร้อมร่างกายวันนี้: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
+                        f"ระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์ {start_of_week_str}): {this_week_km:.2f} km\n\n"
+                        f"{profile_summary}\n"
+                        f"คำสั่ง: ให้วิเคราะห์ผลการวิ่งของวันนี้อย่างตรงไปตรงมา สั้น กระชับ (2-3 บรรทัด) โดยต้องระบุชัดเจนว่า:\n"
+                        f"1. การวิ่งวันนี้ 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (ประเมินเปรียบเทียบจากเพซและอัตราการเต้นหัวใจเทียบกับจุด LT1 เพซ 5:27/HR 172 และ LT2 เพซ 4:37/HR 187)\n"
+                        f"2. ข้อแนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป"
+                    )
+                    run_analysis = call_gemini_with_fallback(client, prompt)
+                except Exception as ai_e:
+                    print(f"[AI] Run evaluation failed: {ai_e}")
+        else:
+            today_run_lines.append("🏃 การวิ่งวันนี้: วันนี้ยังไม่มีบันทึกกิจกรรมการวิ่ง (พักผ่อน หรือยังไม่ได้เริ่มซ้อม)")
+
+        lines = [
+            f"📊 สรุปผลการวิ่ง & สุขภาพประจำวัน ({today})",
+            f"━━━━━━━━━━━━━━━━━━━",
+        ]
+        lines.extend(today_run_lines)
+        lines.append("")
+
+        if run_analysis:
+            lines.append("💡 การประเมินจากโค้ช AI (หนักไป/เบาไป):")
+            lines.append(run_analysis)
+            lines.append("")
+
+        lines.extend([
+            f"📈 สถิติสะสมรอบสัปดาห์:",
+            f"• ระยะวิ่งสะสมสัปดาห์นี้: {this_week_km:.2f} km (เริ่มนับจากวันอาทิตย์ {start_of_week_str})",
+            f"",
+            f"🩺 ข้อมูลสภาพร่างกาย:",
+            f"• Training Readiness: {readiness_score} ({readiness_level})",
+            f"• การนอนหลับ: {sleep_text}",
+            f"• Resting HR: {resting_hr} bpm | ความเครียดเฉลี่ย: {stress}",
+            f"• จำนวนก้าว: {steps:,} / {step_goal:,} ก้าว ({distance_km:.2f} km)",
+        ])
+
+        return "\n".join(lines)
     except Exception as e:
         return f"❌ ไม่สามารถดึงข้อมูลสรุปได้: {e}"
 
@@ -984,7 +1072,9 @@ def ask_gemini_coach(question: str) -> str:
             if "run" in a.get("activityType", {}).get("typeKey", "").lower()
         ]
 
-        start_of_week = today_date - timedelta(days=today_date.weekday())
+        # เริ่มนับสัปดาห์จากวันอาทิตย์ (Sunday)
+        days_since_sunday = (today_date.weekday() + 1) % 7
+        start_of_week = today_date - timedelta(days=days_since_sunday)
         start_of_week_str = start_of_week.isoformat()
         seven_days_ago_str = (today_date - timedelta(days=7)).isoformat()
 
@@ -1011,7 +1101,8 @@ def ask_gemini_coach(question: str) -> str:
                 "avg_hr": a.get("averageHR")
             })
         context["running_mileage_stats"] = {
-            "this_week_km_since_monday": round(this_week_km, 2),
+            "this_week_km_since_sunday": round(this_week_km, 2),
+            "week_start_date": f"{start_of_week_str} (วันอาทิตย์)",
             "past_7_days_total_km": round(past_7d_km, 2),
             "recent_5_runs": recent_summaries
         }
@@ -1069,11 +1160,16 @@ def ask_gemini_coach(question: str) -> str:
         "1. ตารางซ้อมในปฏิทิน Garmin (calendar_scheduled_workouts) คือแผนการซ้อมหลักที่ผู้ใช้กำหนดไว้ (Single Source of Truth) "
         "ห้ามคิดโปรแกรมใหม่ขึ้นมาขัดแย้งกับตารางเดิมเด็ดขาด หากในปฏิทินมีโปรแกรมอยู่แล้ว ให้แนะนำวิธีการปฏิบัติตามแผนนั้นให้สำเร็จอย่างปลอดภัย "
         "หรือหากในปฏิทินเป็น Rest Day หรือไม่มีแผนวิ่ง แนะนำให้พักผ่อน ยืดเหยียด หรือฟื้นฟูเป็นหลัก แต่หากผู้ใช้ต้องการซ้อม สามารถวิ่งเบาๆ (Recovery Run เพซช้ากว่า 6:40 /km, HR < 160-170 bpm) หรือยืดเหยียดได้ โดยต้องควบคุมความหนักให้มีแรงเหลือพร้อมสำหรับตารางซ้อมของวันถัดไปเสมอ\n"
-        "2. ห้ามสับสนระยะวิ่งสะสม: หากจะพูดถึงระยะสะสมรอบสัปดาห์ ให้อ้างอิงจาก 'this_week_km_since_monday' หรือ 'past_7_days_total_km' เท่านั้น "
-        "ห้ามนำผลรวมของประวัติการวิ่ง 20 รายการย้อนหลังมาเหมาว่าเป็นระยะสัปดาห์เด็ดขาด\n"
+        "2. ระยะวิ่งสะสมรอบสัปดาห์: ให้เริ่มนับจาก 'วันอาทิตย์' เสมอ (this_week_km_since_sunday) "
+        "โดยระบุในคำตอบให้ชัดเจนว่าเป็นระยะสะสมที่นับตั้งแต่วันอาทิตย์เป็นต้นมา (ห้ามใช้วันจันทร์) "
+        "และห้ามนำผลรวมของประวัติการวิ่งทั้งหมดมาเหมาว่าเป็นระยะสัปดาห์เด็ดขาด\n"
         "3. หากแผนซ้อมเป็น Easy Run หรือ Recovery: กำชับให้คุมเพซและ HR ให้อยู่ต่ำกว่า LT1 อย่างเคร่งครัด (เพซ 6:00-6:40 /km หรือ HR < 172 bpm) ห้ามแนะนำให้เร่งความเร็ว\n"
         "4. กำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของคุณพรเทพอย่างเคร่งครัด\n"
-        "5. คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE"
+        "5. คำตอบต้องตรงประเด็น นำไปปฏิบัติได้จริง (Actionable) แบ่งหัวข้อให้อ่านง่ายในแชต LINE\n"
+        "6. การวิเคราะห์สรุปผลการวิ่งวันนี้: หากผู้ใช้ถามถึงผลการวิ่ง หรือถามว่าวิ่งวันนี้เป็นอย่างไร หรือหนักไปเบาไปไหม "
+        "ให้สรุปสถิติการวิ่ง และวิเคราะห์ฟันธงชัดเจนว่า 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' "
+        "โดยเปรียบเทียบ Pace และ Heart Rate กับจุดเกณฑ์แลคเตทของคุณพรเทพ (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
+        "รวมถึงวิเคราะห์ผลกระทบต่อความพร้อมและแรงที่จะต้องใช้ซ้อมตามตารางวันถัดไปด้วยเสมอ"
     )
 
     try:
@@ -1754,8 +1850,20 @@ def handle_message(event):
         reply_line(event.reply_token, weight_res)
         return
 
-    # 10. เช็กคำสั่งสรุปข้อมูลสุขภาพประจำวัน
-    if user_text.lower() in ["สถานะ", "วันนี้", "สรุป", "status", "today"]:
+    # 10. เช็กคำสั่งสรุปข้อมูลสุขภาพ & สรุปผลการวิ่งประจำวัน
+    today_summary_exact = ["สถานะ", "วันนี้", "สรุป", "status", "today"]
+    today_summary_phrases = [
+        "สรุปผลการวิ่ง",
+        "สรุปการวิ่ง",
+        "สรุปผลวิ่ง",
+        "ผลการวิ่ง",
+        "ผลวิ่ง",
+        "สรุปวิ่ง",
+        "วิ่งวันนี้",
+        "วันนี้วิ่งเป็นไง",
+        "ซ้อมวันนี้เป็นไง",
+    ]
+    if user_text.lower() in today_summary_exact or any(p in user_text.lower() for p in today_summary_phrases):
         summary_res = handle_today_summary()
         reply_line(event.reply_token, summary_res)
         return
