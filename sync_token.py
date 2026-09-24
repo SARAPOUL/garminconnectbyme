@@ -6,6 +6,8 @@ Sync Garmin Token to Render Web Service
 import os
 import sys
 from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
 import garth
 import requests
 from dotenv import load_dotenv
@@ -26,6 +28,8 @@ def sync():
     loaded = False
     token_b64_env = os.getenv("GARMIN_TOKENS_BASE64", "").strip()
 
+    print(f"[*] ตรวจสอบข้อมูล Authentication: GARMIN_TOKENS_BASE64 ความยาว {len(token_b64_env)} ตัวอักษร")
+
     # 1. โหลดจาก Environment Variable GARMIN_TOKENS_BASE64 (สำหรับ GitHub Actions)
     if token_b64_env:
         try:
@@ -39,6 +43,8 @@ def sync():
             print("    โหลด Session สำเร็จ")
         except Exception as e:
             print(f"⚠️ โหลดจาก GARMIN_TOKENS_BASE64 ไม่สำเร็จ: {e}")
+    else:
+        print("    (ไม่พบค่า GARMIN_TOKENS_BASE64 ใน Environment)")
 
     # 2. โหลดจากโฟลเดอร์ไฟล์บนเครื่อง Local (สำหรับ Mac)
     if not loaded:
