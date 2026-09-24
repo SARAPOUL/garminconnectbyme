@@ -1,0 +1,34 @@
+name: Sync Garmin Token to Render
+
+on:
+  schedule:
+    # รันอัตโนมัติทุก 6 ชั่วโมง
+    - cron: '15 */6 * * *'
+  workflow_dispatch:
+    # ปุ่มกดสั่งรันเองแบบ Manual บนหน้า GitHub Actions
+
+jobs:
+  sync-token:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install garth requests python-dotenv
+
+      - name: Run Token Sync
+        env:
+          GARMIN_TOKENS_BASE64: ${{ secrets.GARMIN_TOKENS_BASE64 }}
+          RENDER_APP_URL: ${{ secrets.RENDER_APP_URL || 'https://garminconnectbyme.onrender.com' }}
+          TOKEN_UPDATE_SECRET: ${{ secrets.TOKEN_UPDATE_SECRET || 'garmin_token_secret_sync_key' }}
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+        run: python sync_token.py
