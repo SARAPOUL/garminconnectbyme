@@ -7,6 +7,7 @@ venv/
 .venv/
 dumped_token.txt
 *dumped_token*.txt
+*token*.txt
 GEMINI.md
 *.token
 latest_draft_plan.json

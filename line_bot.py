@@ -142,7 +142,37 @@ def get_garmin(force_refresh: bool = False):
     garmin = Garmin()
 
     auth_errors = []
-    # 1. เช็ก Token Base64 จาก Environment Variable
+
+    # 1. เช็กจากโฟลเดอร์ไฟล์ Token ในเครื่อง/Container ก่อน (หากถูกอัปเดตผ่าน /update-token)
+    possible_dirs = [
+        TOKEN_DIR,
+        Path.home() / ".garminconnect",
+        PROJECT_DIR,
+        Path.cwd(),
+        Path("/etc/secrets"),
+    ]
+    for p in possible_dirs:
+        if (p / "oauth1_token.json").exists() or (p / "garmin_tokens.json").exists():
+            try:
+                garmin.login(str(p))
+                if hasattr(garmin, "garth") and garmin.garth.oauth2_token:
+                    if not garmin.garth.oauth2_token.expired:
+                        _garmin_client = garmin
+                        print(f"[AUTH] Successfully loaded active Garmin tokens from directory: {p}")
+                        return _garmin_client
+                    else:
+                        print(f"[AUTH] Token in {p} is expired, trying to refresh...")
+                        try:
+                            garmin.garth.refresh_oauth2()
+                            _garmin_client = garmin
+                            print(f"[AUTH] Refreshed token in {p} successfully!")
+                            return _garmin_client
+                        except Exception as re_err:
+                            print(f"[AUTH] Refresh in {p} failed: {re_err}")
+            except Exception as e:
+                auth_errors.append(f"Dir {p.name}: {e}")
+
+    # 2. เช็ก Token Base64 จาก Environment Variable
     tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
     if tokens_base64:
         clean_token = "".join(tokens_base64.split()).strip("'\"")
@@ -171,6 +201,13 @@ def get_garmin(force_refresh: bool = False):
                 except Exception:
                     pass
 
+                # บันทึกเก็บไว้ใน TOKEN_DIR เพื่อใช้งานต่อ
+                try:
+                    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+                    garmin.garth.save(str(TOKEN_DIR))
+                except Exception:
+                    pass
+
                 _garmin_client = garmin
                 print(f"[AUTH] Successfully loaded Garmin tokens for {garmin.full_name} ({garmin.display_name})")
                 return _garmin_client
@@ -181,25 +218,6 @@ def get_garmin(force_refresh: bool = False):
             auth_errors.append("Library mismatch: 'Garmin' has no 'garth'")
     else:
         auth_errors.append("ไม่พบ Environment Variable 'GARMIN_TOKENS_BASE64'")
-
-    # 2. เช็กจากโฟลเดอร์ไฟล์ Token
-    possible_dirs = [
-        TOKEN_DIR,
-        PROJECT_DIR,
-        Path.cwd(),
-        Path("/etc/secrets"),
-        Path.home() / ".garminconnect",
-    ]
-    for p in possible_dirs:
-        if (p / "oauth1_token.json").exists() or (p / "garmin_tokens.json").exists():
-            try:
-                garmin.login(str(p))
-                _garmin_client = garmin
-                print(f"[AUTH] Successfully loaded Garmin tokens from directory: {p}")
-                return _garmin_client
-            except Exception as e:
-                auth_errors.append(f"Dir {p.name}: {e}")
-                print(f"[AUTH] Error loading from {p}: {e}")
 
     # 3. ลอง Login ด้วย Email/Password หากตั้งค่าไว้ใน Environment
     garmin_email = os.getenv("GARMIN_EMAIL")
@@ -1668,6 +1686,47 @@ def index():
 @app.head("/uptime")
 def uptime_endpoint():
     return PlainTextResponse(handle_server_uptime(), status_code=200)
+
+
+@app.post("/update-token")
+async def update_token_endpoint(request: Request):
+    """Endpoint สำหรับรับ Token Base64 สดใหม่เพื่ออัปเดต Session บน Render ทันทีโดยไม่ต้อง Restart"""
+    secret_header = request.headers.get("X-Update-Secret", "")
+    expected_secret = os.getenv("TOKEN_UPDATE_SECRET", "garmin_token_secret_sync_key")
+    if secret_header != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    new_token_b64 = data.get("token_base64", "").strip()
+    if not new_token_b64:
+        raise HTTPException(status_code=400, detail="Missing token_base64")
+
+    global _garmin_client
+    try:
+        clean_token = "".join(new_token_b64.split()).strip("'\"")
+        missing_padding = len(clean_token) % 4
+        if missing_padding:
+            clean_token += "=" * (4 - missing_padding)
+
+        new_garmin = Garmin()
+        new_garmin.garth.loads(clean_token)
+        if new_garmin.garth.profile:
+            new_garmin.display_name = new_garmin.garth.profile.get("displayName")
+            new_garmin.full_name = new_garmin.garth.profile.get("fullName")
+
+        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        new_garmin.garth.save(str(TOKEN_DIR))
+
+        _garmin_client = new_garmin
+        print(f"[AUTH] Successfully updated Garmin tokens via /update-token for {new_garmin.display_name}")
+        return JSONResponse({"status": "success", "display_name": new_garmin.display_name})
+    except Exception as e:
+        print(f"[AUTH] Failed to apply updated token: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _run_morning_report_task(today_str: str):
