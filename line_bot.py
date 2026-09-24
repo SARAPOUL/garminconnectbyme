@@ -303,6 +303,81 @@ def handle_record_weight(user_text: str) -> str:
         return f"❌ ไม่สามารถบันทึกน้ำหนักได้: {e}"
 
 
+def format_activity_laps_detail(garmin, activity_id: int) -> dict:
+    """ดึงรายละเอียด Laps / Intervals ของกิจกรรม เพื่อแยกแยะช่วงวิ่งจริง (Work), พัก (Rest), Warm up, Cool down"""
+    try:
+        splits = garmin.get_activity_splits(activity_id)
+        if not isinstance(splits, dict):
+            return {"display_text": "", "ai_context": "", "has_intervals": False}
+        laps = splits.get("lapDTOs", [])
+        if not laps or len(laps) <= 1:
+            return {"display_text": "", "ai_context": "", "has_intervals": False}
+
+        active_laps = [l for l in laps if l.get("intensityType") in ["ACTIVE", "INTERVAL"]]
+        recovery_laps = [l for l in laps if l.get("intensityType") in ["RECOVERY", "REST"]]
+        warmup_laps = [l for l in laps if l.get("intensityType") == "WARMUP"]
+        cooldown_laps = [l for l in laps if l.get("intensityType") == "COOLDOWN"]
+
+        lines = []
+
+        if active_laps:
+            total_work_dist = sum(l.get("distance", 0) for l in active_laps)
+            total_work_dur = sum(l.get("duration", 0) for l in active_laps)
+            work_spd = total_work_dist / total_work_dur if total_work_dur > 0 else 0
+            pm, ps = divmod(int(1000 / work_spd), 60) if work_spd > 0 else (0, 0)
+            work_hrs = [l.get("averageHR") for l in active_laps if l.get("averageHR")]
+            avg_work_hr = sum(work_hrs) / len(work_hrs) if work_hrs else 0
+
+            lines.append(f"  ⚡ ช่วงวิ่งจริง/อินเทอร์วอล (Work Intervals): รวม {total_work_dist/1000:.2f} km | เพซเฉลี่ย {pm}:{ps:02d} /km | HR เฉลี่ย {avg_work_hr:.0f} bpm")
+
+            for idx, al in enumerate(active_laps, 1):
+                d = al.get("distance", 0)
+                dur = al.get("duration", 0)
+                spd = al.get("averageSpeed", 0)
+                lpm, lps = divmod(int(1000 / spd), 60) if spd > 0 else (0, 0)
+                lhr = al.get("averageHR", "-")
+                lines.append(f"     • เซต {idx} ({d:.0f}m): เพซ {lpm}:{lps:02d} /km | HR {lhr} bpm")
+
+            if recovery_laps:
+                rec_dur = sum(l.get("duration", 0) for l in recovery_laps)
+                rec_hrs = [l.get("averageHR") for l in recovery_laps if l.get("averageHR")]
+                avg_rec_hr = sum(rec_hrs) / len(rec_hrs) if rec_hrs else 0
+                lines.append(f"  ☕ ช่วงพัก/ฟื้นตัว (Recovery): {len(recovery_laps)} ครั้ง (รวม {rec_dur/60:.1f} นาที) | HR เฉลี่ย {avg_rec_hr:.0f} bpm")
+
+            if warmup_laps:
+                wm_dist = sum(l.get("distance", 0) for l in warmup_laps)
+                wm_dur = sum(l.get("duration", 0) for l in warmup_laps)
+                wm_spd = wm_dist / wm_dur if wm_dur > 0 else 0
+                wpm, wps = divmod(int(1000 / wm_spd), 60) if wm_spd > 0 else (0, 0)
+                lines.append(f"  🔥 Warm up: {wm_dist/1000:.2f} km ({wm_dur/60:.1f} นาที) | เพซ {wpm}:{wps:02d} /km")
+
+            if cooldown_laps:
+                cd_dist = sum(l.get("distance", 0) for l in cooldown_laps)
+                cd_dur = sum(l.get("duration", 0) for l in cooldown_laps)
+                cd_spd = cd_dist / cd_dur if cd_dur > 0 else 0
+                cpm, cps = divmod(int(1000 / cd_spd), 60) if cd_spd > 0 else (0, 0)
+                lines.append(f"  ❄️ Cool down: {cd_dist/1000:.2f} km ({cd_dur/60:.1f} นาที) | เพซ {cpm}:{cps:02d} /km")
+        else:
+            lines.append("  ⏱️ รายละเอียดแต่ละกิโลเมตร (Splits):")
+            for i, l in enumerate(laps[:8], 1):
+                spd = l.get("averageSpeed", 0)
+                pm, ps = divmod(int(1000 / spd), 60) if spd > 0 else (0, 0)
+                hr = l.get("averageHR", "-")
+                lines.append(f"     • กม. {i}: เพซ {pm}:{ps:02d} /km | HR {hr} bpm")
+            if len(laps) > 8:
+                lines.append(f"     ...และอีก {len(laps) - 8} Laps")
+
+        joined = "\n".join(lines)
+        return {
+            "display_text": joined,
+            "ai_context": joined,
+            "has_intervals": bool(active_laps),
+        }
+    except Exception as e:
+        print(f"[SPLITS] Error getting splits for {activity_id}: {e}")
+        return {"display_text": "", "ai_context": "", "has_intervals": False}
+
+
 def handle_today_summary() -> str:
     try:
         garmin = get_garmin()
@@ -344,7 +419,25 @@ def handle_today_summary() -> str:
         except Exception:
             pass
 
-        # 2. ดึงประวัติกิจกรรมการวิ่ง และคำนวณระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์)
+        # 2. ดึงเป้าหมายตารางซ้อมวันนี้จาก Calendar (ถ้ามี)
+        today_scheduled_workout_text = "ไม่มีรายการกำหนดในตารางวันนี้"
+        try:
+            cal = garmin.connectapi(f"/calendar-service/year/{today_date.year}/month/{today_date.month - 1}")
+            items = cal.get("calendarItems", [])
+            for i in items:
+                if i.get("itemType") == "workout" and i.get("date") == today:
+                    wid = i.get("workoutId")
+                    w_detail = None
+                    try:
+                        w_detail = garmin.connectapi(f"/workout-service/workout/{wid}")
+                    except Exception:
+                        pass
+                    today_scheduled_workout_text = summarize_workout_detail(i, w_detail)
+                    break
+        except Exception:
+            pass
+
+        # 3. ดึงประวัติกิจกรรมการวิ่ง และคำนวณระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์)
         activities = []
         try:
             activities = garmin.get_activities(0, 20)
@@ -365,13 +458,15 @@ def handle_today_summary() -> str:
 
         today_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) == today]
 
-        # 3. สรุปผลการวิ่งของวันนี้และวิเคราะห์ว่า หนักไปไหม หรือ เบาไปไหม
+        # 4. สรุปผลการวิ่งของวันนี้และวิเคราะห์ว่า หนักไปไหม หรือ เบาไปไหม (เจาะลึก Lap / Interval จริง)
         run_analysis = ""
         today_run_lines = []
+        today_run_ai_lines = []
         if today_runs:
             today_run_lines.append("🏃 กิจกรรมการวิ่งวันนี้:")
             for a in today_runs:
                 name = a.get("activityName", "Running")
+                act_id = a.get("activityId")
                 dist = (a.get("distance") or 0) / 1000
                 dur = (a.get("duration") or 0) / 60
                 speed = a.get("averageSpeed", 0)
@@ -383,10 +478,21 @@ def handle_today_summary() -> str:
                 max_hr = a.get("maxHR", "-")
                 aerobic_te = a.get("aerobicTrainingEffect", "-")
                 anaerobic_te = a.get("anaerobicTrainingEffect", "-")
+
+                # ดึง Laps / Intervals Breakdown
+                laps_info = format_activity_laps_detail(garmin, act_id) if act_id else {"display_text": "", "ai_context": ""}
+                laps_str = f"\n{laps_info['display_text']}" if laps_info.get("display_text") else ""
+
                 today_run_lines.append(
                     f"• {name}: {dist:.2f} km ({dur:.0f} นาที)\n"
-                    f"  - เพซเฉลี่ย: {pace_str} | HR เฉลี่ย: {avg_hr} bpm (สูงสุด: {max_hr} bpm)\n"
+                    f"  - เพซเฉลี่ยรวม: {pace_str} | HR เฉลี่ย: {avg_hr} bpm (สูงสุด: {max_hr} bpm)\n"
                     f"  - Training Effect: Aerobic {aerobic_te} | Anaerobic {anaerobic_te}"
+                    f"{laps_str}"
+                )
+
+                today_run_ai_lines.append(
+                    f"• กิจกรรม: {name} (ระยะรวม {dist:.2f} km, เพซรวม {pace_str}, HR เฉลี่ย {avg_hr} bpm, สูงสุด {max_hr} bpm)\n"
+                    f"  รายละเอียด Lap/Intervals จริง:\n{laps_info.get('ai_context') or 'ไม่มีข้อมูล Lap ย่อย'}"
                 )
 
             # ให้ AI ช่วยวิเคราะห์ผลการวิ่งว่าหนักไปหรือเบาไปไหม
@@ -398,14 +504,17 @@ def handle_today_summary() -> str:
                     prompt = (
                         f"คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ\n"
                         f"วันที่: {today}\n"
-                        f"ข้อมูลการวิ่งวันนี้:\n" + "\n".join(today_run_lines) + "\n\n"
+                        f"เป้าหมายตารางซ้อมวันนี้ที่กำหนดไว้ (ถ้ามี):\n{today_scheduled_workout_text}\n\n"
+                        f"ข้อมูลการวิ่งจริงวันนี้ (รวมถึงสถิติช่วง Work Intervals และช่วงพัก):\n" + "\n".join(today_run_ai_lines) + "\n\n"
                         f"ความพร้อมร่างกายวันนี้: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
                         f"ระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์ {start_of_week_str}): {this_week_km:.2f} km\n\n"
                         f"{profile_summary}\n"
-                        f"คำสั่ง: ให้วิเคราะห์ผลการวิ่งของวันนี้อย่างตรงไปตรงมา สั้น กระชับ (2-3 บรรทัด) โดยต้องระบุชัดเจนว่า:\n"
-                        f"1. การวิ่งวันนี้ 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (ประเมินเปรียบเทียบจากเพซและอัตราการเต้นหัวใจเทียบกับจุด LT1 เพซ 5:27/HR 172 และ LT2 เพซ 4:37/HR 187)\n"
-                        f"2. ข้อแนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป\n"
-                        f"3. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด ให้สื่อสารเนื้อหาโดยตรงอย่างมืออาชีพ"
+                        f"กฎสำคัญในการวิเคราะห์ผลการวิ่ง:\n"
+                        f"1. สำหรับการซ้อมแบบ Interval / Threshold / โปรแกรมที่มีช่วงพัก หรือเซตความเร็ว:\n"
+                        f"   ห้ามนำ 'เพซเฉลี่ยรวมทั้งกิจกรรม' มาตัดสินว่าวิ่งช้าหรือเบาไปเด็ดขาด เพราะเพซเฉลี่ยรวมมีการรวมช่วงวอร์มอัพ คูลดาวน์ และช่วงพัก ให้ตัดสินความเร็วและความหนักจาก 'ช่วงวิ่งจริง (Work/Fast Intervals)' เทียบกับเป้าหมายของตารางและจุดเกณฑ์แลคเตท LT1/LT2\n"
+                        f"2. สรุปฟันธงชัดเจนว่าการวิ่งวันนี้ 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (2-3 บรรทัด)\n"
+                        f"3. แนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป\n"
+                        f"4. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด และตัดคำสุภาพ (ครับ/ค่ะ) ทิ้งทั้งหมด"
                     )
                     run_analysis = call_gemini_with_fallback(client, prompt)
                 except Exception as ai_e:
@@ -1122,7 +1231,10 @@ def ask_gemini_coach(question: str) -> str:
         past_7d_km = sum((a.get("distance") or 0) for a in past_7d_runs) / 1000.0
 
         recent_summaries = []
+        today_runs_detail = []
         for a in running_acts[:5]:
+            act_date = a.get("startTimeLocal", "")[:10]
+            act_id = a.get("activityId")
             dist = (a.get("distance") or 0) / 1000
             dur = (a.get("duration") or 0) / 60
             speed = a.get("averageSpeed", 0)
@@ -1130,19 +1242,30 @@ def ask_gemini_coach(question: str) -> str:
             if speed > 0:
                 p_min, p_sec = divmod(int(1000 / speed), 60)
                 pace = f"{p_min}:{p_sec:02d}"
-            recent_summaries.append({
-                "date": a.get("startTimeLocal", "")[:10],
+            item = {
+                "date": act_date,
+                "name": a.get("activityName", "Running"),
                 "distance_km": round(dist, 2),
                 "duration_min": round(dur, 1),
                 "pace": pace,
-                "avg_hr": a.get("averageHR")
-            })
+                "avg_hr": a.get("averageHR"),
+                "max_hr": a.get("maxHR")
+            }
+            if act_date == today and act_id:
+                laps_info = format_activity_laps_detail(garmin, act_id)
+                if laps_info.get("ai_context"):
+                    item["laps_breakdown"] = laps_info["ai_context"]
+                today_runs_detail.append(item)
+            recent_summaries.append(item)
+
         context["running_mileage_stats"] = {
             "this_week_km_since_sunday": round(this_week_km, 2),
             "week_start_date": f"{start_of_week_str} (วันอาทิตย์)",
             "past_7_days_total_km": round(past_7d_km, 2),
             "recent_5_runs": recent_summaries
         }
+        if today_runs_detail:
+            context["today_runs_detail"] = today_runs_detail
 
         # 2. ดึงตารางซ้อมในปฏิทิน Garmin สัปดาห์นี้ เพื่อใช้เป็น Single Source of Truth
         try:
@@ -1205,7 +1328,8 @@ def ask_gemini_coach(question: str) -> str:
         "5. กำหนด Pace หรือ Heart Rate โดยยึดตามผล Lactate Test (LT1 เพซ 5:27 / HR 172, LT2 เพซ 4:37 / HR 187, Easy 6:00-6:40 /km) ของนักกีฬาอย่างเคร่งครัด\n"
         "6. การวิเคราะห์สรุปผลการวิ่งวันนี้: หากผู้ใช้ถามถึงผลการวิ่ง หรือถามว่าวิ่งวันนี้เป็นอย่างไร หรือหนักไปเบาไปไหม "
         "ให้สรุปสถิติการวิ่ง และวิเคราะห์ฟันธงชัดเจนว่า 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' "
-        "โดยเปรียบเทียบ Pace และ Heart Rate กับจุดเกณฑ์แลคเตทของนักกีฬา (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
+        "สำหรับเซสชัน Interval / Threshold / โปรแกรมที่มีช่วงพัก หรือเซตความเร็ว: "
+        "ห้ามนำ 'เพซเฉลี่ยรวมทั้งกิจกรรม' มาตัดสินว่าวิ่งช้าหรือเบาไปเด็ดขาด เพราะเพซเฉลี่ยรวมมีการรวมช่วงวอร์มอัพ คูลดาวน์ และช่วงพัก ให้ตัดสินความเร็วและความหนักจาก 'ช่วงวิ่งจริง (Work/Fast Intervals)' เทียบกับเป้าหมายของตารางและจุดเกณฑ์แลคเตท LT1/LT2 (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187, Easy 6:00-6:40 /km) "
         "รวมถึงวิเคราะห์ผลกระทบต่อความพร้อมและแรงที่จะต้องใช้ซ้อมตามตารางวันถัดไปด้วยเสมอ\n"
         "7. ภาษาและข้อห้าม: ตอบเป็นภาษาไทยแบบกระชับ ตรงประเด็น ตัดคำสุภาพ (เช่น ครับ/ค่ะ/นะคะ), คำทักทาย (เช่น สวัสดี/ได้เลยครับ), และคำเกริ่นนำทิ้งทั้งหมด "
         "ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด"
