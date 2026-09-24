@@ -204,7 +204,7 @@ def get_garmin(force_refresh: bool = False):
                 # บันทึกเก็บไว้ใน TOKEN_DIR เพื่อใช้งานต่อ
                 try:
                     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-                    garmin.garth.save(str(TOKEN_DIR))
+                    garmin.garth.dump(str(TOKEN_DIR))
                 except Exception:
                     pass
 
@@ -1719,7 +1719,7 @@ async def update_token_endpoint(request: Request):
             new_garmin.full_name = new_garmin.garth.profile.get("fullName")
 
         TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        new_garmin.garth.save(str(TOKEN_DIR))
+        new_garmin.garth.dump(str(TOKEN_DIR))
 
         _garmin_client = new_garmin
         print(f"[AUTH] Successfully updated Garmin tokens via /update-token for {new_garmin.display_name}")
