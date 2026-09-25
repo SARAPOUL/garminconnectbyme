@@ -4,7 +4,7 @@ LINE Bot Webhook Server for Garmin Connect & AI Running Coach
 รองรับ:
 1. ดึงตารางซ้อมล่วงหน้า (Garmin Coach / Calendar Plan)
 2. วิเคราะห์คำแนะนำการซ้อมประจำวันแบบสั้นๆ อิงจาก Training Readiness & Sleep จริง
-3. ส่งแจ้งเตือนอัตโนมัติทุก 8 โมงเช้า (Push Message)
+3. ส่งแจ้งเตือนอัตโนมัติทุกเที่ยงวัน 12:00 น. (Push Message)
 4. โต้ตอบตามสั่งทันทีเมื่อพิมพ์ "ขอตารางวันนี้", "ตารางซ้อม"
 5. บันทึกน้ำหนักเข้า Garmin Connect
 """
@@ -880,7 +880,7 @@ def handle_daily_workout_report() -> str:
                     f"- วันนี้วันที่: {today_str}\n"
                     f"- รายละเอียดตารางซ้อมวันนี้จาก Garmin Connect:\n{today_workout_detail_text}\n"
                     f"- ตารางซ้อมวันอื่นๆ ในสัปดาห์นี้: {weekly_context_str}\n"
-                    f"- สภาพร่างกายเช้านี้:\n"
+                    f"- สภาพร่างกายวันนี้:\n"
                     f"  • Training Readiness: {readiness_score} ({readiness_level})\n"
                     f"  • การนอนหลับ: {sleep_text}\n\n"
                     f"{profile_context}\n"
@@ -915,7 +915,7 @@ def handle_daily_workout_report() -> str:
             f"💡 คำแนะนำจากโค้ช AI:",
             f"{advice}",
             f"",
-            f"📊 สภาพร่างกายเช้านี้:",
+            f"📊 สภาพร่างกายวันนี้:",
             f"• Training Readiness: {readiness_score} ({readiness_level})",
             f"• การนอนหลับ: {sleep_text}",
             f"",
@@ -1770,21 +1770,21 @@ def push_plan_to_garmin(user_id: str) -> str:
     return "\n".join(lines)
 
 
-# Background Scheduler สำหรับส่ง 08:00 AM ทุกวัน
-async def morning_push_scheduler():
+# Background Scheduler สำหรับส่ง 12:00 PM (เที่ยงวัน) ทุกวัน
+async def daily_push_scheduler():
     global _last_daily_push_date
     tz_bkk = timezone(timedelta(hours=7))
-    print("[SCHEDULER] Daily 08:00 AM morning push notification worker started.")
+    print("[SCHEDULER] Daily 12:00 PM noon push notification worker started.")
 
     while True:
         try:
             now = datetime.now(tz_bkk)
             today_str = now.date().isoformat()
 
-            # ส่งเฉพาะช่วง 08:00 - 08:05 น. และยังไม่ได้ส่งวันนี้
-            if now.hour == 8 and now.minute < 5:
+            # ส่งเฉพาะช่วง 12:00 - 12:05 น. และยังไม่ได้ส่งวันนี้
+            if now.hour == 12 and now.minute < 5:
                 if _last_daily_push_date != today_str:
-                    print(f"[SCHEDULER] Triggering morning report for {today_str}...")
+                    print(f"[SCHEDULER] Triggering daily report for {today_str}...")
                     report_text = handle_daily_workout_report()
                     if LINE_ALLOWED_USER_ID:
                         push_line(LINE_ALLOWED_USER_ID, report_text)
@@ -1797,7 +1797,7 @@ async def morning_push_scheduler():
 
 @app.on_event("startup")
 async def on_startup():
-    asyncio.create_task(morning_push_scheduler())
+    asyncio.create_task(daily_push_scheduler())
 
 
 @app.get("/")
@@ -1853,28 +1853,28 @@ async def update_token_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _run_morning_report_task(today_str: str):
+def _run_daily_report_task(today_str: str):
     global _last_daily_push_date
     try:
-        print(f"[CRON] Running background morning report for {today_str}...")
+        print(f"[CRON] Running background daily report for {today_str}...")
         report_text = handle_daily_workout_report()
         if LINE_ALLOWED_USER_ID:
             push_line(LINE_ALLOWED_USER_ID, report_text)
             _last_daily_push_date = today_str
             print(f"[CRON] Daily report pushed successfully to {LINE_ALLOWED_USER_ID}")
     except Exception as e:
-        print(f"[CRON] Error in background morning report: {e}")
+        print(f"[CRON] Error in background daily report: {e}")
 
 
 @app.get("/cron/daily-workout")
 @app.post("/cron/daily-workout")
 @app.head("/cron/daily-workout")
 def cron_daily_workout(background_tasks: BackgroundTasks):
-    """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอน 8 โมงเช้า เพื่อปลุก Render"""
+    """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอนเที่ยงวัน เพื่อปลุก Render"""
     tz_bkk = timezone(timedelta(hours=7))
     today_str = datetime.now(tz_bkk).date().isoformat()
 
-    background_tasks.add_task(_run_morning_report_task, today_str)
+    background_tasks.add_task(_run_daily_report_task, today_str)
     return PlainTextResponse("OK", status_code=200)
 
 
