@@ -92,7 +92,11 @@ def sync():
                     pass
                 break
     except Exception as e:
-        print(f"⚠️ Refresh OAuth2 ไม่สำเร็จ ({e}) จะใช้ Token ที่มีอยู่ส่งต่อไป...")
+        print(f"⚠️ Refresh OAuth2 ไม่สำเร็จ ({e})")
+        if getattr(garth.client.oauth2_token, "expired", True):
+            print("❌ Token ปัจจุบันหมดอายุแล้ว และไม่สามารถ Refresh ได้ (IP นี้ถูก Garmin บล็อก 429)")
+            sys.exit(1)
+        print("    Token ปัจจุบันยังไม่หมดอายุ จะลองส่ง Token เดิมต่อไป...")
 
     token_b64 = garth.client.dumps()
 

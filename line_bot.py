@@ -1838,9 +1838,12 @@ async def update_token_endpoint(request: Request):
 
         new_garmin = Garmin()
         new_garmin.garth.loads(clean_token)
-        if new_garmin.garth.profile:
-            new_garmin.display_name = new_garmin.garth.profile.get("displayName")
-            new_garmin.full_name = new_garmin.garth.profile.get("fullName")
+        try:
+            if new_garmin.garth.profile:
+                new_garmin.display_name = new_garmin.garth.profile.get("displayName")
+                new_garmin.full_name = new_garmin.garth.profile.get("fullName")
+        except Exception as prof_err:
+            print(f"[AUTH] Non-fatal: Could not fetch profile on update: {prof_err}")
 
         TOKEN_DIR.mkdir(parents=True, exist_ok=True)
         new_garmin.garth.dump(str(TOKEN_DIR))
