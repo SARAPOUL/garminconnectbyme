@@ -1,4 +1,6 @@
 garminconnect==0.2.8
+garth
+requests
 python-dotenv
 fastapi
 uvicorn
