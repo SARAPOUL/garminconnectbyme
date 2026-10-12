@@ -375,28 +375,125 @@ def format_activity_laps_detail(garmin, activity_id: int) -> dict:
         }
     except Exception as e:
         print(f"[SPLITS] Error getting splits for {activity_id}: {e}")
-        return {"display_text": "", "ai_context": "", "has_intervals": False}
+THAI_MONTHS = {
+    "ม.ค.": 1, "มกรา": 1, "มกราคม": 1,
+    "ก.พ.": 2, "กุมภา": 2, "กุมภาพันธ์": 2,
+    "มี.ค.": 3, "มีนา": 3, "มีนาคม": 3,
+    "เม.ย.": 4, "เมษา": 4, "เมษายน": 4,
+    "พ.ค.": 5, "พฤษภา": 5, "พฤษภาพันธ์": 5,
+    "มิ.ย.": 6, "มิถุนา": 6, "มิถุนายน": 6,
+    "ก.ค.": 7, "กรกฎา": 7, "กรกฎาคม": 7,
+    "ส.ค.": 8, "สิงหา": 8, "สิงหาคม": 8,
+    "ก.ย.": 9, "กันยา": 9, "กันยายน": 9,
+    "ต.ค.": 10, "ตุลา": 10, "ตุลาคม": 10,
+    "พ.ย.": 11, "พฤศจิกา": 11, "พฤศจิกายน": 11,
+    "ธ.ค.": 12, "ธันวา": 12, "ธันวาคม": 12,
+}
+
+
+def parse_query_date(text: str, base_date: date) -> Optional[date]:
+    """สกัดวันที่จากข้อความของผู้ใช้ รองรับรูปแบบสัมพัทธ์, ISO, วัน/เดือนไทย, วัน/เดือน/ปี"""
+    if not text:
+        return None
+    t = text.lower().strip()
+
+    # วันสัมพัทธ์
+    if "เมื่อวาน" in t or "yesterday" in t:
+        return base_date - timedelta(days=1)
+    if "วานซืน" in t:
+        return base_date - timedelta(days=2)
+    if "วันนี้" in t or "today" in t:
+        return base_date
+
+    # รูปแบบ ISO: YYYY-MM-DD หรือ YYYY/MM/DD
+    m_iso = re.search(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', t)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        if y > 2400:
+            y -= 543
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    # รูปแบบ วันที่ + ชื่อเดือนไทย เช่น "วันที่ 10 ต.ค.", "10 ต.ค. 2569", "วันที่ 10 ตุลาคม"
+    month_pattern = '|'.join(re.escape(k) for k in sorted(THAI_MONTHS.keys(), key=len, reverse=True))
+    m_thai = re.search(r'(?:วันที่\s*)?(\d{1,2})\s*(' + month_pattern + r')(?:\s*(\d{2,4}))?', t)
+    if m_thai:
+        d = int(m_thai.group(1))
+        m = THAI_MONTHS[m_thai.group(2)]
+        y = base_date.year
+        if m_thai.group(3):
+            y_val = int(m_thai.group(3))
+            y = y_val - 543 if y_val > 2400 else (y_val + 2000 if y_val < 100 else y_val)
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    # รูปแบบ Slash: DD/MM/YYYY หรือ DD/MM
+    m_slash = re.search(r'(?:วันที่\s*)?(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', t)
+    if m_slash:
+        d = int(m_slash.group(1))
+        m = int(m_slash.group(2))
+        y = base_date.year
+        if m_slash.group(3):
+            y_val = int(m_slash.group(3))
+            y = y_val - 543 if y_val > 2400 else (y_val + 2000 if y_val < 100 else y_val)
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    # ระบุเฉพาะวัน เช่น "วันที่ 10", "วันที่ 7"
+    m_day = re.search(r'วันที่\s*(\d{1,2})\b', t)
+    if m_day:
+        d = int(m_day.group(1))
+        m = base_date.month
+        y = base_date.year
+        if d > base_date.day:
+            m = base_date.month - 1 or 12
+            if m == 12:
+                y -= 1
+        try:
+            return date(y, m, d)
+        except ValueError:
+            pass
+
+    return None
 
 
 def handle_today_summary() -> str:
+    """เรียกสรุปผลการวิ่งและความพร้อมของวันนี้ (ย้อนหลังไปใช้ handle_date_summary)"""
+    return handle_date_summary(None)
+
+
+def handle_date_summary(target_date: Optional[date] = None) -> str:
+    """สรุปผลการวิ่งและวิเคราะห์ความหนักเบาเจาะลึกแต่ละเซต (Lap / Interval) ตามวันที่ระบุ หรือวันนี้"""
     try:
         garmin = get_garmin()
         tz_bkk = timezone(timedelta(hours=7))
-        today_date = datetime.now(tz_bkk).date()
-        today = today_date.isoformat()
+        current_date = datetime.now(tz_bkk).date()
+        query_date = target_date if target_date else current_date
+        query_str = query_date.isoformat()
+        is_today = (query_date == current_date)
 
-        # 1. ดึงข้อมูลสุขภาพทั่วไป
-        summary = garmin.get_user_summary(today)
-        steps = summary.get("totalSteps", 0)
-        step_goal = summary.get("dailyStepGoal", 0)
-        distance_km = (summary.get("totalDistanceMeters") or 0) / 1000
-        calories = summary.get("totalKilocalories", 0)
-        resting_hr = summary.get("restingHeartRate", "-")
-        stress = summary.get("averageStressLevel", "-")
+        # 1. ดึงข้อมูลสุขภาพทั่วไปของวันนั้น
+        summary = {}
+        try:
+            summary = garmin.get_user_summary(query_str)
+        except Exception:
+            pass
+        steps = summary.get("totalSteps", 0) if isinstance(summary, dict) else 0
+        step_goal = summary.get("dailyStepGoal", 0) if isinstance(summary, dict) else 0
+        distance_km = ((summary.get("totalDistanceMeters") or 0) / 1000) if isinstance(summary, dict) else 0
+        calories = summary.get("totalKilocalories", 0) if isinstance(summary, dict) else 0
+        resting_hr = summary.get("restingHeartRate", "-") if isinstance(summary, dict) else "-"
+        stress = summary.get("averageStressLevel", "-") if isinstance(summary, dict) else "-"
 
         sleep_text = "-"
         try:
-            sleep = garmin.get_sleep_data(today)
+            sleep = garmin.get_sleep_data(query_str)
             dto = sleep.get("dailySleepDTO", {})
             sec = dto.get("sleepTimeSeconds", 0)
             score = dto.get("sleepScores", {}).get("overall", {}).get("value", "-")
@@ -409,7 +506,7 @@ def handle_today_summary() -> str:
         readiness_score = "-"
         readiness_level = "-"
         try:
-            r = garmin.get_training_readiness(today)
+            r = garmin.get_training_readiness(query_str)
             if isinstance(r, list) and r:
                 readiness_score = r[0].get("score", "-")
                 readiness_level = r[0].get("level", "-")
@@ -419,28 +516,28 @@ def handle_today_summary() -> str:
         except Exception:
             pass
 
-        # 2. ดึงเป้าหมายตารางซ้อมวันนี้จาก Calendar (ถ้ามี)
-        today_scheduled_workout_text = "ไม่มีรายการกำหนดในตารางวันนี้"
+        # 2. ดึงเป้าหมายตารางซ้อมของวันนั้นจาก Calendar (ถ้ามี)
+        scheduled_workout_text = "ไม่มีรายการกำหนดในตารางวันนั้น"
         try:
-            cal = garmin.connectapi(f"/calendar-service/year/{today_date.year}/month/{today_date.month - 1}")
+            cal = garmin.connectapi(f"/calendar-service/year/{query_date.year}/month/{query_date.month - 1}")
             items = cal.get("calendarItems", [])
             for i in items:
-                if i.get("itemType") == "workout" and i.get("date") == today:
+                if i.get("itemType") == "workout" and i.get("date") == query_str:
                     wid = i.get("workoutId")
                     w_detail = None
                     try:
                         w_detail = garmin.connectapi(f"/workout-service/workout/{wid}")
                     except Exception:
                         pass
-                    today_scheduled_workout_text = summarize_workout_detail(i, w_detail)
+                    scheduled_workout_text = summarize_workout_detail(i, w_detail)
                     break
         except Exception:
             pass
 
-        # 3. ดึงประวัติกิจกรรมการวิ่ง และคำนวณระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์)
+        # 3. ดึงประวัติกิจกรรมการวิ่ง และคำนวณระยะสะสมของสัปดาห์นั้น (เริ่มจากวันอาทิตย์)
         activities = []
         try:
-            activities = garmin.get_activities(0, 20)
+            activities = garmin.get_activities(0, 50)
         except Exception:
             pass
 
@@ -449,22 +546,25 @@ def handle_today_summary() -> str:
             if "run" in a.get("activityType", {}).get("typeKey", "").lower()
         ]
 
-        days_since_sunday = (today_date.weekday() + 1) % 7
-        start_of_week = today_date - timedelta(days=days_since_sunday)
+        days_since_sunday = (query_date.weekday() + 1) % 7
+        start_of_week = query_date - timedelta(days=days_since_sunday)
         start_of_week_str = start_of_week.isoformat()
 
-        this_week_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) >= start_of_week_str]
+        this_week_runs = [a for a in running_acts if start_of_week_str <= (a.get("startTimeLocal", "")[:10]) <= query_str]
         this_week_km = sum((a.get("distance") or 0) for a in this_week_runs) / 1000.0
 
-        today_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) == today]
+        target_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) == query_str]
 
-        # 4. สรุปผลการวิ่งของวันนี้และวิเคราะห์ว่า หนักไปไหม หรือ เบาไปไหม (เจาะลึก Lap / Interval จริง)
+        # 4. สรุปผลการวิ่งของวันนั้นและวิเคราะห์ว่า หนักไปไหม หรือ เบาไปไหม (เจาะลึก Lap / Interval จริง)
         run_analysis = ""
-        today_run_lines = []
-        today_run_ai_lines = []
-        if today_runs:
-            today_run_lines.append("🏃 กิจกรรมการวิ่งวันนี้:")
-            for a in today_runs:
+        run_lines = []
+        run_ai_lines = []
+        date_title_label = f"ประจำวัน ({query_str})" if is_today else f"ประจำวันที่ {query_str}"
+        date_section_label = f"วันนี้ ({query_str})" if is_today else f"วันที่ {query_str}"
+
+        if target_runs:
+            run_lines.append(f"🏃 กิจกรรมการวิ่ง{date_section_label}:")
+            for a in target_runs:
                 name = a.get("activityName", "Running")
                 act_id = a.get("activityId")
                 dist = (a.get("distance") or 0) / 1000
@@ -483,14 +583,14 @@ def handle_today_summary() -> str:
                 laps_info = format_activity_laps_detail(garmin, act_id) if act_id else {"display_text": "", "ai_context": ""}
                 laps_str = f"\n{laps_info['display_text']}" if laps_info.get("display_text") else ""
 
-                today_run_lines.append(
+                run_lines.append(
                     f"• {name}: {dist:.2f} km ({dur:.0f} นาที)\n"
                     f"  - เพซเฉลี่ยรวม: {pace_str} | HR เฉลี่ย: {avg_hr} bpm (สูงสุด: {max_hr} bpm)\n"
                     f"  - Training Effect: Aerobic {aerobic_te} | Anaerobic {anaerobic_te}"
                     f"{laps_str}"
                 )
 
-                today_run_ai_lines.append(
+                run_ai_lines.append(
                     f"• กิจกรรม: {name} (ระยะรวม {dist:.2f} km, เพซรวม {pace_str}, HR เฉลี่ย {avg_hr} bpm, สูงสุด {max_hr} bpm)\n"
                     f"  รายละเอียด Lap/Intervals จริง:\n{laps_info.get('ai_context') or 'ไม่มีข้อมูล Lap ย่อย'}"
                 )
@@ -503,30 +603,30 @@ def handle_today_summary() -> str:
                     profile_summary = format_athlete_profile_summary(profile)
                     prompt = (
                         f"คุณคือ Personal Running Coach มืออาชีพ ที่ต้องการเพิ่ม performance นักกีฬาอย่างมีประสิทธิภาพ\n"
-                        f"วันที่: {today}\n"
-                        f"เป้าหมายตารางซ้อมวันนี้ที่กำหนดไว้ (ถ้ามี):\n{today_scheduled_workout_text}\n\n"
-                        f"ข้อมูลการวิ่งจริงวันนี้ (รวมถึงสถิติช่วง Work Intervals และช่วงพัก):\n" + "\n".join(today_run_ai_lines) + "\n\n"
-                        f"ความพร้อมร่างกายวันนี้: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
-                        f"ระยะสะสมสัปดาห์นี้ (เริ่มจากวันอาทิตย์ {start_of_week_str}): {this_week_km:.2f} km\n\n"
+                        f"วันที่: {query_str}\n"
+                        f"เป้าหมายตารางซ้อมที่กำหนดไว้ (ถ้ามี):\n{scheduled_workout_text}\n\n"
+                        f"ข้อมูลการวิ่งจริงของวันที่ {query_str} (รวมถึงสถิติช่วง Work Intervals และช่วงพักแต่ละเซต):\n" + "\n".join(run_ai_lines) + "\n\n"
+                        f"ความพร้อมร่างกายในวันนั้น: Training Readiness {readiness_score} ({readiness_level}), การนอนหลับ {sleep_text}\n"
+                        f"ระยะสะสมสัปดาห์นั้น (นับจากวันอาทิตย์ {start_of_week_str} ถึง {query_str}): {this_week_km:.2f} km\n\n"
                         f"{profile_summary}\n"
                         f"กฎสำคัญในการวิเคราะห์ผลการวิ่ง:\n"
-                        f"1. สำหรับการซ้อมแบบ Interval / Threshold / โปรแกรมที่มีช่วงพัก หรือเซตความเร็ว:\n"
-                        f"   ห้ามนำ 'เพซเฉลี่ยรวมทั้งกิจกรรม' มาตัดสินว่าวิ่งช้าหรือเบาไปเด็ดขาด เพราะเพซเฉลี่ยรวมมีการรวมช่วงวอร์มอัพ คูลดาวน์ และช่วงพัก ให้ตัดสินความเร็วและความหนักจาก 'ช่วงวิ่งจริง (Work/Fast Intervals)' เทียบกับเป้าหมายของตารางและจุดเกณฑ์แลคเตท LT1/LT2\n"
-                        f"2. สรุปฟันธงชัดเจนว่าการวิ่งวันนี้ 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (2-3 บรรทัด)\n"
-                        f"3. แนะนำการฟื้นฟูร่างกายเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป\n"
+                        f"1. สำหรับการซ้อมแบบ Interval / Threshold / Marathon Pace / โปรแกรมที่มีช่วงพัก หรือแบ่งเซต:\n"
+                        f"   ห้ามนำ 'เพซเฉลี่ยรวมทั้งกิจกรรม' มาตัดสินว่าวิ่งช้าหรือเบาไปเด็ดขาด เพราะเพซเฉลี่ยรวมมีการรวมช่วงวอร์มอัพ คูลดาวน์ และช่วงพัก ให้ตัดสินความเร็วและความหนักจาก 'ช่วงวิ่งจริง (Work/Fast Intervals)' ในแต่ละเซต เทียบกับเป้าหมายของตารางและจุดเกณฑ์แลคเตท LT1/LT2 (LT1 เพซ 5:27/HR 172, LT2 เพซ 4:37/HR 187)\n"
+                        f"2. สรุปฟันธงชัดเจนว่าการวิ่งในวันที่ {query_str} 'หนักไปไหม เบาไปไหม หรือเหมาะสมแล้ว' (2-3 บรรทัด)\n"
+                        f"3. แนะนำการฟื้นฟูร่างกายหรือข้อสังเกตเพื่อเตรียมพร้อมสำหรับตารางวันถัดไป\n"
                         f"4. ข้อห้ามเด็ดขาด: ห้ามพิมพ์ชื่อ 'คุณพรเทพ' หรือเอ่ยชื่อผู้รับสารในข้อความเด็ดขาด และตัดคำสุภาพ (ครับ/ค่ะ) ทิ้งทั้งหมด"
                     )
                     run_analysis = call_gemini_with_fallback(client, prompt)
                 except Exception as ai_e:
                     print(f"[AI] Run evaluation failed: {ai_e}")
         else:
-            today_run_lines.append("🏃 การวิ่งวันนี้: วันนี้ยังไม่มีบันทึกกิจกรรมการวิ่ง (พักผ่อน หรือยังไม่ได้เริ่มซ้อม)")
+            run_lines.append(f"🏃 การวิ่ง{date_section_label}: ไม่มีบันทึกกิจกรรมการวิ่งในวันนี้ (พักผ่อน หรือไม่มีการบันทึกกิจกรรม)")
 
         lines = [
-            f"📊 สรุปผลการวิ่ง & สุขภาพประจำวัน ({today})",
+            f"📊 สรุปผลการวิ่ง & สุขภาพ{date_title_label}",
             f"━━━━━━━━━━━━━━━━━━━",
         ]
-        lines.extend(today_run_lines)
+        lines.extend(run_lines)
         lines.append("")
 
         if run_analysis:
@@ -536,9 +636,9 @@ def handle_today_summary() -> str:
 
         lines.extend([
             f"📈 สถิติสะสมรอบสัปดาห์:",
-            f"• ระยะวิ่งสะสมสัปดาห์นี้: {this_week_km:.2f} km (เริ่มนับจากวันอาทิตย์ {start_of_week_str})",
+            f"• ระยะวิ่งสะสมสัปดาห์นี้: {this_week_km:.2f} km (นับจากวันอาทิตย์ {start_of_week_str})",
             f"",
-            f"🩺 ข้อมูลสภาพร่างกาย:",
+            f"🩺 ข้อมูลสภาพร่างกาย ({query_str}):",
             f"• Training Readiness: {readiness_score} ({readiness_level})",
             f"• การนอนหลับ: {sleep_text}",
             f"• Resting HR: {resting_hr} bpm | ความเครียดเฉลี่ย: {stress}",
@@ -1230,9 +1330,13 @@ def ask_gemini_coach(question: str) -> str:
         past_7d_runs = [a for a in running_acts if (a.get("startTimeLocal", "")[:10]) >= seven_days_ago_str]
         past_7d_km = sum((a.get("distance") or 0) for a in past_7d_runs) / 1000.0
 
+        target_q_date = parse_query_date(question, today_date)
+        target_q_date_str = target_q_date.isoformat() if target_q_date else None
+        target_date_runs = []
+
         recent_summaries = []
         today_runs_detail = []
-        for a in running_acts[:5]:
+        for a in running_acts[:10]:
             act_date = a.get("startTimeLocal", "")[:10]
             act_id = a.get("activityId")
             dist = (a.get("distance") or 0) / 1000
@@ -1251,21 +1355,26 @@ def ask_gemini_coach(question: str) -> str:
                 "avg_hr": a.get("averageHR"),
                 "max_hr": a.get("maxHR")
             }
-            if act_date == today and act_id:
+            if act_id and (act_date == today or (target_q_date_str and act_date == target_q_date_str)):
                 laps_info = format_activity_laps_detail(garmin, act_id)
                 if laps_info.get("ai_context"):
                     item["laps_breakdown"] = laps_info["ai_context"]
-                today_runs_detail.append(item)
+                if act_date == today:
+                    today_runs_detail.append(item)
+                if target_q_date_str and act_date == target_q_date_str:
+                    target_date_runs.append(item)
             recent_summaries.append(item)
 
         context["running_mileage_stats"] = {
             "this_week_km_since_sunday": round(this_week_km, 2),
             "week_start_date": f"{start_of_week_str} (วันอาทิตย์)",
             "past_7_days_total_km": round(past_7d_km, 2),
-            "recent_5_runs": recent_summaries
+            "recent_runs": recent_summaries
         }
         if today_runs_detail:
             context["today_runs_detail"] = today_runs_detail
+        if target_date_runs:
+            context[f"runs_detail_for_{target_q_date_str}"] = target_date_runs
 
         # 2. ดึงตารางซ้อมในปฏิทิน Garmin สัปดาห์นี้ เพื่อใช้เป็น Single Source of Truth
         try:
@@ -1354,21 +1463,6 @@ def ask_gemini_coach(question: str) -> str:
 # ระบบออกแบบตารางซ้อมแบบ Custom (AI Coach & Garmin Sync)
 # -------------------------------------------------------------
 DRAFT_PLAN_FILE = PROJECT_DIR / "latest_draft_plan.json"
-
-THAI_MONTHS = {
-    "ม.ค.": 1, "มกรา": 1, "มกราคม": 1,
-    "ก.พ.": 2, "กุมภา": 2, "กุมภาพันธ์": 2,
-    "มี.ค.": 3, "มีนา": 3, "มีนาคม": 3,
-    "เม.ย.": 4, "เมษา": 4, "เมษายน": 4,
-    "พ.ค.": 5, "พฤษภา": 5, "พฤษภาคม": 5,
-    "มิ.ย.": 6, "มิถุนา": 6, "มิถุนายน": 6,
-    "ก.ค.": 7, "กรกฎา": 7, "กรกฎาคม": 7,
-    "ส.ค.": 8, "สิงหา": 8, "สิงหาคม": 8,
-    "ก.ย.": 9, "กันยา": 9, "กันยายน": 9,
-    "ต.ค.": 10, "ตุลา": 10, "ตุลาคม": 10,
-    "พ.ย.": 11, "พฤศจิกา": 11, "พฤศจิกายน": 11,
-    "ธ.ค.": 12, "ธันวา": 12, "ธันวาคม": 12,
-}
 
 
 def clear_draft_plan():
@@ -2058,9 +2152,17 @@ def handle_message(event):
         reply_line(event.reply_token, weight_res)
         return
 
-    # 10. เช็กคำสั่งสรุปข้อมูลสุขภาพ & สรุปผลการวิ่งประจำวัน
-    today_summary_exact = ["สถานะ", "วันนี้", "สรุป", "status", "today"]
-    today_summary_phrases = [
+    # 10. เช็กคำสั่งสรุปข้อมูลสุขภาพ & สรุปผลการวิ่ง (รองรับระบุวันที่ เช่น "วันที่ 2026-10-10 วิ่งเป็นไงบ้าง", "วิ่งเมื่อวานเป็นไง", "สรุปวิ่งวันที่ 4")
+    tz_bkk = timezone(timedelta(hours=7))
+    now_date = datetime.now(tz_bkk).date()
+    extracted_date = parse_query_date(user_text, now_date)
+
+    summary_exact = ["สถานะ", "วันนี้", "เมื่อวาน", "สรุป", "status", "today", "yesterday"]
+    summary_keywords = [
+        "วิ่งเป็นไง",
+        "ซ้อมเป็นไง",
+        "วิ่งเป็นอย่างไร",
+        "ซ้อมเป็นอย่างไร",
         "สรุปผลการวิ่ง",
         "สรุปการวิ่ง",
         "สรุปผลวิ่ง",
@@ -2068,11 +2170,33 @@ def handle_message(event):
         "ผลวิ่ง",
         "สรุปวิ่ง",
         "วิ่งวันนี้",
-        "วันนี้วิ่งเป็นไง",
-        "ซ้อมวันนี้เป็นไง",
+        "วิ่งเมื่อวาน",
+        "ซ้อมเมื่อวาน",
+        "วิ่งล่าสุด",
+        "ซ้อมล่าสุด",
     ]
-    if user_text.lower() in today_summary_exact or any(p in user_text.lower() for p in today_summary_phrases):
-        summary_res = handle_today_summary()
+
+    is_summary_request = (
+        user_text.lower() in summary_exact
+        or any(k in user_text.lower() for k in summary_keywords)
+        or (extracted_date is not None and any(w in user_text.lower() for w in ["วิ่ง", "ซ้อม", "ผล", "สรุป", "run", "workout"]))
+    )
+
+    if is_summary_request:
+        target_date = extracted_date
+        # หากถามถึง "ล่าสุด" ให้หาวันที่ของกิจกรรมวิ่งล่าสุด
+        if not target_date and any(w in user_text.lower() for w in ["ล่าสุด", "วิ่งล่าสุด", "ซ้อมล่าสุด"]):
+            try:
+                g_temp = get_garmin()
+                r_acts = g_temp.get_activities(0, 5)
+                for ra in r_acts:
+                    if "run" in ra.get("activityType", {}).get("typeKey", "").lower():
+                        target_date = datetime.strptime(ra.get("startTimeLocal", "")[:10], "%Y-%m-%d").date()
+                        break
+            except Exception:
+                pass
+
+        summary_res = handle_date_summary(target_date)
         reply_line(event.reply_token, summary_res)
         return
 
