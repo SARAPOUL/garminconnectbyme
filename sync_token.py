@@ -9,8 +9,14 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 import garth
+import garth.sso
 import requests
 from dotenv import load_dotenv
+
+garth.sso.OAUTH_CONSUMER = {
+    "consumer_key": "fc3e99d2-118c-44b8-8ae3-03370dde24c0",
+    "consumer_secret": "E08WAR897WEy2knn7aFBrvegVAf0AFdWBBF",
+}
 
 PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(PROJECT_DIR / ".env")
@@ -94,7 +100,13 @@ def sync():
     except Exception as e:
         print(f"⚠️ Refresh OAuth2 ไม่สำเร็จ ({e})")
         if getattr(garth.client.oauth2_token, "expired", True):
-            print("❌ Token ปัจจุบันหมดอายุแล้ว และไม่สามารถ Refresh ได้ (IP นี้ถูก Garmin บล็อก 429)")
+            err_str = str(e)
+            if "429" in err_str:
+                print("❌ Token ปัจจุบันหมดอายุแล้ว และไม่สามารถ Refresh ได้ (IP นี้ถูก Garmin บล็อก 429)")
+            elif "NameResolutionError" in err_str or "Connection" in err_str:
+                print("❌ Token ปัจจุบันหมดอายุแล้ว และไม่สามารถเชื่อมต่ออินเทอร์เน็ต/DNS ได้")
+            else:
+                print("❌ Token ปัจจุบันหมดอายุแล้ว และไม่สามารถ Refresh ได้")
             sys.exit(1)
         print("    Token ปัจจุบันยังไม่หมดอายุ จะลองส่ง Token เดิมต่อไป...")
 

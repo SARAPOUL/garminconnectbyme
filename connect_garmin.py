@@ -26,6 +26,15 @@ except ImportError:
 # โหลดตัวแปรจากไฟล์ .env (หากมี)
 load_dotenv()
 
+try:
+    import garth.sso
+    garth.sso.OAUTH_CONSUMER = {
+        "consumer_key": "fc3e99d2-118c-44b8-8ae3-03370dde24c0",
+        "consumer_secret": "E08WAR897WEy2knn7aFBrvegVAf0AFdWBBF",
+    }
+except Exception:
+    pass
+
 # กำหนดไดเรกทอรีเก็บ Token ไว้ในโฟลเดอร์โปรเจกต์ (หรือ fallback ไปที่ home)
 PROJECT_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = PROJECT_DIR / ".garminconnect"
