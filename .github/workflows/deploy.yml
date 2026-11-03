@@ -1,0 +1,46 @@
+name: Deploy to Mac Home Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS, X64, mac-home-server]
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync stack and rebuild container on OrbStack
+        env:
+          APP_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:$HOME/.orbstack/bin:$PATH"
+
+          SAFE_APP_NAME="$(printf '%s' "$APP_NAME" | tr '[:upper:]_' '[:lower:]-')"
+          TARGET_DIR="$HOME/server/stacks/$SAFE_APP_NAME"
+
+          mkdir -p "$TARGET_DIR/.garminconnect"
+
+          # Sync โค้ดไปยังโฟลเดอร์ Stacks โดยไม่ลบไฟล์ .env และ Token ใน .garminconnect บนเครื่องเก่า
+          rsync -av --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.env' \
+            --exclude '.garminconnect' \
+            ./ "$TARGET_DIR/"
+
+          cd "$TARGET_DIR"
+
+          if [ ! -f ".env" ]; then
+            echo "ERROR: ไม่พบไฟล์ $TARGET_DIR/.env กรุณาส่งไฟล์ .env ขึ้นเครื่องเก่าก่อน Deploy"
+            exit 1
+          fi
+
+          docker compose up -d --build --remove-orphans
+          docker image prune -f

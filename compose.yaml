@@ -1,0 +1,19 @@
+networks:
+  proxy-net:
+    external: true
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${APP_NAME:-garminconnectbyme}
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HOST_PORT:-8001}:${APP_PORT:-8000}"
+    volumes:
+      - ./.garminconnect:/app/.garminconnect
+    networks:
+      - proxy-net

@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.git/
+.github/
+.env
+.garminconnect/
+*token*.txt
+*.token
+.DS_Store
