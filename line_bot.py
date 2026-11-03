@@ -61,9 +61,8 @@ except ImportError:
     genai = None
 
 # โหลดค่า Environment Variables
-load_dotenv()
-
 PROJECT_DIR = Path(__file__).resolve().parent
+load_dotenv(PROJECT_DIR / ".env")
 TOKEN_DIR = PROJECT_DIR / ".garminconnect"
 if not TOKEN_DIR.exists():
     home_token = Path.home() / ".garminconnect"
@@ -89,10 +88,175 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 app = FastAPI(title="Garmin LINE Bot")
 
-# Cache Garmin Client
+# Cache Garmin Client & Rate Limit Protection
 _garmin_client = None
 _last_daily_push_date = None
+_last_token_check_ts = 0.0
+_rate_limit_until = 0.0
+_last_auth_error = ""
 _SERVER_START_TIME = datetime.now(timezone(timedelta(hours=7)))
+
+RATE_LIMIT_COOLDOWN_SECONDS = 300  # พัก 5 นาทีเมื่อเจอ 429 Too Many Requests
+
+
+def _is_rate_limit_error(err: Exception) -> bool:
+    msg = str(err)
+    return "429" in msg or "Too Many Requests" in msg
+
+
+def _is_auth_http_error(err: Exception) -> bool:
+    msg = str(err)
+    if any(code in msg for code in ("401", "403", "Unauthorized", "Forbidden")):
+        return True
+    inner = getattr(err, "error", None)
+    resp = getattr(inner, "response", None) or getattr(err, "response", None)
+    status_code = getattr(resp, "status_code", None)
+    return status_code in (401, 403)
+
+
+def _set_rate_limit_cooldown(err: Exception):
+    global _rate_limit_until, _last_auth_error
+    _rate_limit_until = time.time() + RATE_LIMIT_COOLDOWN_SECONDS
+    _last_auth_error = str(err)
+    print(f"[AUTH] Hit Garmin 429 Rate Limit. Entering cooldown for {RATE_LIMIT_COOLDOWN_SECONDS}s.")
+
+
+def _get_rate_limit_remaining() -> int:
+    rem = int(_rate_limit_until - time.time())
+    return rem if rem > 0 else 0
+
+
+def _save_garmin_tokens(garmin_instance) -> bool:
+    """บันทึก OAuth1 และ OAuth2 Token ปัจจุบันลงโฟลเดอร์ .garminconnect ทันที"""
+    try:
+        if hasattr(garmin_instance, "garth") and garmin_instance.garth.oauth1_token:
+            target_dir = PROJECT_DIR / ".garminconnect"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            garmin_instance.garth.dump(str(target_dir))
+            print(f"[AUTH] Saved Garmin tokens to {target_dir}")
+            return True
+    except Exception as e:
+        print(f"[AUTH] Warning: Failed to save Garmin tokens to disk: {e}")
+    return False
+
+
+def _is_oauth2_expiring_soon(garmin_instance, buffer_seconds: int = 300) -> bool:
+    """ตรวจสอบว่า OAuth2 Token หมดอายุแล้วหรือกำลังจะหมดอายุภายใน buffer_seconds วินาที"""
+    if not hasattr(garmin_instance, "garth"):
+        return True
+    oauth2 = getattr(garmin_instance.garth, "oauth2_token", None)
+    if not oauth2 or getattr(oauth2, "expired", True):
+        return True
+    expires_at = getattr(oauth2, "expires_at", 0) or 0
+    if expires_at and (expires_at - time.time() < buffer_seconds):
+        return True
+    return False
+
+
+def _configure_garth_client(garmin_instance):
+    """ปรับแต่ง Garth Client:
+    1. ปิดการยิงซ้ำอัตโนมัติของ urllib3 เมื่อเจอ 429 (ลดการยิงซ้ำรัวๆ ที่ทำให้โดนแบนยาว)
+    2. ดัก refresh_oauth2() ให้บันทึกไฟล์ลง .garminconnect อัตโนมัติ และ Fallback ไปใช้ Email/Password เมื่อ OAuth1 หมดอายุ
+    3. ดัก request() เมื่อเจอ 401/403 ระหว่างใช้งาน ให้ Auto Re-login แล้วลองยิงซ้ำให้อัตโนมัติ 1 ครั้ง
+    """
+    if not hasattr(garmin_instance, "garth"):
+        return
+
+    g_client = garmin_instance.garth
+    try:
+        g_client.configure(
+            status_forcelist=(408, 500, 502, 503, 504),
+            retries=1,
+            backoff_factor=0.5,
+        )
+    except Exception:
+        pass
+
+    if getattr(g_client, "_auto_hooked", False):
+        return
+
+    orig_refresh_oauth2 = g_client.refresh_oauth2
+    orig_request = g_client.request
+
+    def wrapped_refresh_oauth2():
+        rem = _get_rate_limit_remaining()
+        if rem > 0:
+            raise RuntimeError(f"ติด Garmin Rate Limit (429) กรุณารอ Cooldown อีก {rem} วินาที")
+        try:
+            res = orig_refresh_oauth2()
+            _save_garmin_tokens(garmin_instance)
+            return res
+        except Exception as ref_err:
+            if _is_rate_limit_error(ref_err):
+                _set_rate_limit_cooldown(ref_err)
+                raise
+            # กรณี OAuth1 หมดอายุหรือใช้แลก OAuth2 ไม่ได้ ให้ Fallback ล็อกอินด้วย Email/Password อัตโนมัติ
+            garmin_email = os.getenv("GARMIN_EMAIL")
+            garmin_password = os.getenv("GARMIN_PASSWORD")
+            if garmin_email and garmin_password:
+                print(f"[AUTH] OAuth1 refresh failed ({ref_err}), auto-logging in with GARMIN_EMAIL...")
+                try:
+                    g_client.login(garmin_email, garmin_password)
+                    _save_garmin_tokens(garmin_instance)
+                    print("[AUTH] Auto-login via credentials succeeded and saved to .garminconnect!")
+                    return
+                except Exception as login_err:
+                    if _is_rate_limit_error(login_err):
+                        _set_rate_limit_cooldown(login_err)
+                    raise login_err
+            raise
+
+    def wrapped_request(method: str, subdomain: str, path: str, /, api: bool = False, referrer: Union[str, bool] = False, headers: dict = {}, **kwargs):
+        try:
+            return orig_request(method, subdomain, path, api=api, referrer=referrer, headers=dict(headers), **kwargs)
+        except Exception as req_err:
+            if _is_rate_limit_error(req_err):
+                _set_rate_limit_cooldown(req_err)
+                raise
+            if api and _is_auth_http_error(req_err) and _get_rate_limit_remaining() == 0:
+                print(f"[AUTH] Got 401/403 on {path}. Triggering auto re-auth and retrying once...")
+                try:
+                    wrapped_refresh_oauth2()
+                    return orig_request(method, subdomain, path, api=api, referrer=referrer, headers=dict(headers), **kwargs)
+                except Exception as retry_err:
+                    if _is_rate_limit_error(retry_err):
+                        _set_rate_limit_cooldown(retry_err)
+                        raise retry_err
+                    # หากแลกผ่าน OAuth1 แล้วยังติด 401/403 ให้บังคับ Login ใหม่ด้วย Email/Password
+                    garmin_email = os.getenv("GARMIN_EMAIL")
+                    garmin_password = os.getenv("GARMIN_PASSWORD")
+                    if garmin_email and garmin_password and _get_rate_limit_remaining() == 0:
+                        try:
+                            print("[AUTH] Retrying full credential login after 401/403...")
+                            g_client.login(garmin_email, garmin_password)
+                            _save_garmin_tokens(garmin_instance)
+                            return orig_request(method, subdomain, path, api=api, referrer=referrer, headers=dict(headers), **kwargs)
+                        except Exception as cred_err:
+                            if _is_rate_limit_error(cred_err):
+                                _set_rate_limit_cooldown(cred_err)
+                            raise cred_err
+                    raise retry_err
+            raise
+
+    g_client.refresh_oauth2 = wrapped_refresh_oauth2
+    g_client.request = wrapped_request
+    g_client._auto_hooked = True
+
+
+def _populate_garmin_profile(garmin_instance):
+    """ดึงข้อมูลชื่อผู้ใช้และหน่วยวัดอย่างปลอดภัยโดยไม่ทำให้ Session ล้มเหลวถ้าดึงไม่ได้"""
+    try:
+        if garmin_instance.garth.profile:
+            garmin_instance.display_name = garmin_instance.garth.profile.get("displayName")
+            garmin_instance.full_name = garmin_instance.garth.profile.get("fullName")
+    except Exception:
+        pass
+    try:
+        settings = garmin_instance.garth.connectapi("/userprofile-service/userprofile/user-settings")
+        if isinstance(settings, dict):
+            garmin_instance.unit_system = settings.get("userData", {}).get("measurementSystem")
+    except Exception:
+        pass
 
 
 def handle_server_uptime() -> str:
@@ -112,133 +276,208 @@ def handle_server_uptime() -> str:
     parts.append(f"{minutes} นาที {seconds} วินาที")
     uptime_str = " ".join(parts)
 
+    # ตรวจสอบสถานะ Garmin Token ปัจจุบัน
+    token_status_lines = []
+    cooldown_rem = _get_rate_limit_remaining()
+    if cooldown_rem > 0:
+        c_min, c_sec = divmod(cooldown_rem, 60)
+        token_status_lines.append(f"⏳ สถานะ Garmin: ติด Rate Limit Cooldown (รออีก {c_min} นาที {c_sec} วินาที)")
+
+    oauth2_obj = None
+    display_user = "-"
+    if _garmin_client and hasattr(_garmin_client, "garth"):
+        oauth2_obj = getattr(_garmin_client.garth, "oauth2_token", None)
+        display_user = getattr(_garmin_client, "full_name", None) or getattr(_garmin_client, "display_name", None) or "-"
+    else:
+        oauth2_file = (PROJECT_DIR / ".garminconnect" / "oauth2_token.json")
+        if oauth2_file.exists():
+            try:
+                raw_o2 = json.loads(oauth2_file.read_text(encoding="utf-8"))
+                exp_ts = raw_o2.get("expires_at", 0)
+                if exp_ts:
+                    exp_dt = datetime.fromtimestamp(exp_ts, tz=tz_bkk)
+                    rem_sec = int(exp_ts - time.time())
+                    if rem_sec > 0:
+                        token_status_lines.append(
+                            f"🔑 Garmin Token (ไฟล์): ปกติ (หมดอายุ {exp_dt.strftime('%d/%m %H:%M:%S')} | เหลือ {rem_sec // 60} นาที)"
+                        )
+                    else:
+                        token_status_lines.append(
+                            f"🔄 Garmin Token (ไฟล์): รอ Auto-Refresh (หมดอายุเมื่อ {exp_dt.strftime('%d/%m %H:%M:%S')})"
+                        )
+            except Exception:
+                pass
+
+    if oauth2_obj:
+        exp_ts = getattr(oauth2_obj, "expires_at", 0) or 0
+        exp_dt = datetime.fromtimestamp(exp_ts, tz=tz_bkk) if exp_ts else None
+        rem_sec = int(exp_ts - time.time()) if exp_ts else 0
+        exp_str = exp_dt.strftime("%d/%m %H:%M:%S") if exp_dt else "N/A"
+        if rem_sec > 0:
+            token_status_lines.append(f"👤 บัญชี Garmin: {display_user}")
+            token_status_lines.append(f"🔑 OAuth2 Token: ปกติ (หมดอายุ {exp_str} | เหลือ {rem_sec // 60} นาที)")
+        else:
+            token_status_lines.append(f"👤 บัญชี Garmin: {display_user}")
+            token_status_lines.append(f"🔄 OAuth2 Token: รอ Auto-Refresh ({exp_str})")
+
+    if not token_status_lines:
+        token_status_lines.append("🔑 Garmin Token: ยังไม่ได้โหลด Session (จะโหลดอัตโนมัติเมื่อใช้งาน)")
+
     lines = [
-        "🖥️ สถานะการทำงานของเซิร์ฟเวอร์ (Render)",
+        "🖥️ สถานะการทำงานของเซิร์ฟเวอร์ (Local Server)",
         "━━━━━━━━━━━━━━━━━━━",
         "🟢 สถานะ: กำลังทำงาน (Online / Live)",
         f"⏱️ ทำงานต่อเนื่องมาแล้ว: {uptime_str}",
         f"🚀 เริ่มสตาร์ตเมื่อ: {_SERVER_START_TIME.strftime('%d/%m/%Y %H:%M:%S')} (เวลาไทย)",
         "━━━━━━━━━━━━━━━━━━━",
-        "💡 โควตา Free Tier ของ Render มี 750 ชั่วโมง/เดือน",
+        *token_status_lines,
+        "💡 ระบบดูแลต่ออายุ Token และ Auto-Login อัตโนมัติ (พิมพ์ 'ล็อกอินใหม่' หากต้องการบังคับรีเฟรชทันที)",
     ]
     return "\n".join(lines)
 
 
-def get_garmin(force_refresh: bool = False):
-    global _garmin_client
-    if _garmin_client is not None and not force_refresh:
-        # ตรวจสอบว่า OAuth2 Token ที่แคชไว้หมดอายุหรือไม่ ถ้าหมดให้ Auto-Refresh บน Cloud ทันที
-        if hasattr(_garmin_client, "garth") and getattr(_garmin_client.garth, "oauth2_token", None):
-            if _garmin_client.garth.oauth2_token.expired:
-                print("[AUTH] Cached OAuth2 token expired. Auto-refreshing on cloud via OAuth1...")
-                try:
-                    _garmin_client.garth.refresh_oauth2()
-                    print("[AUTH] Successfully refreshed cached OAuth2 token on cloud.")
-                except Exception as ref_err:
-                    print(f"[AUTH] Failed to refresh cached OAuth2: {ref_err}")
-                    _garmin_client = None
-        if _garmin_client is not None:
+def get_garmin(force_refresh: bool = False, force_credentials: bool = False):
+    global _garmin_client, _rate_limit_until
+    if force_credentials:
+        _rate_limit_until = 0.0
+        _garmin_client = None
+
+    rem_cooldown = _get_rate_limit_remaining()
+    if rem_cooldown > 0:
+        c_min, c_sec = divmod(rem_cooldown, 60)
+        raise RuntimeError(
+            f"เซิร์ฟเวอร์ Garmin จำกัดจำนวนครั้งชั่วคราว (429 Rate Limit) ระบบกำลังพัก Cooldown อีก {c_min} นาที {c_sec} วินาที เพื่อป้องกัน IP ถูกบล็อก (หรือพิมพ์ 'ล็อกอินใหม่' เมื่อครบเวลา)"
+        )
+
+    # 0. ใช้ Client ที่แคชไว้ในหน่วยความจำ และต่ออายุล่วงหน้าอัตโนมัติหากใกล้หมดอายุ
+    if _garmin_client is not None and not force_refresh and not force_credentials:
+        _configure_garth_client(_garmin_client)
+        if _is_oauth2_expiring_soon(_garmin_client, buffer_seconds=300):
+            print("[AUTH] Cached OAuth2 token expired or expiring soon. Auto-refreshing...")
+            try:
+                _garmin_client.garth.refresh_oauth2()
+                print("[AUTH] Successfully refreshed cached OAuth2 token and saved to .garminconnect.")
+                return _garmin_client
+            except Exception as ref_err:
+                print(f"[AUTH] Failed to refresh cached OAuth2: {ref_err}")
+                _garmin_client = None
+                if _is_rate_limit_error(ref_err):
+                    raise RuntimeError(
+                        "เซิร์ฟเวอร์ Garmin จำกัดจำนวนครั้งชั่วคราว (429 Too Many Requests) ระบบพัก Cooldown 5 นาทีแล้วจะต่ออายุให้อัตโนมัติ"
+                    )
+        else:
             return _garmin_client
 
     garmin = Garmin()
-
+    _configure_garth_client(garmin)
     auth_errors = []
 
-    # 1. เช็กจากโฟลเดอร์ไฟล์ Token ในเครื่อง/Container ก่อน (หากถูกอัปเดตผ่าน /update-token)
-    possible_dirs = [
-        TOKEN_DIR,
-        Path.home() / ".garminconnect",
-        PROJECT_DIR,
-        Path.cwd(),
-        Path("/etc/secrets"),
-    ]
-    for p in possible_dirs:
-        if (p / "oauth1_token.json").exists() or (p / "garmin_tokens.json").exists():
-            try:
-                garmin.login(str(p))
-                if hasattr(garmin, "garth") and garmin.garth.oauth2_token:
-                    if not garmin.garth.oauth2_token.expired:
-                        _garmin_client = garmin
-                        print(f"[AUTH] Successfully loaded active Garmin tokens from directory: {p}")
-                        return _garmin_client
-                    else:
-                        print(f"[AUTH] Token in {p} is expired, trying to refresh...")
-                        try:
-                            garmin.garth.refresh_oauth2()
-                            _garmin_client = garmin
-                            print(f"[AUTH] Refreshed token in {p} successfully!")
-                            return _garmin_client
-                        except Exception as re_err:
-                            print(f"[AUTH] Refresh in {p} failed: {re_err}")
-            except Exception as e:
-                auth_errors.append(f"Dir {p.name}: {e}")
+    # 1. โหลดจากโฟลเดอร์ .garminconnect บน Local Server เป็นหลัก (เว้นแต่สั่งบังคับล็อกอินใหม่ด้วยรหัสผ่าน)
+    if not force_credentials:
+        possible_dirs = [
+            PROJECT_DIR / ".garminconnect",
+            TOKEN_DIR,
+            Path.home() / ".garminconnect",
+        ]
+        seen_dirs = set()
+        for p in possible_dirs:
+            p_resolved = str(p.resolve()) if p.exists() else str(p)
+            if p_resolved in seen_dirs:
+                continue
+            seen_dirs.add(p_resolved)
 
-    # 2. เช็ก Token Base64 จาก Environment Variable
+            if (p / "oauth1_token.json").exists():
+                try:
+                    garmin.garth.load(str(p))
+                    _configure_garth_client(garmin)
+                    if _is_oauth2_expiring_soon(garmin, buffer_seconds=300):
+                        print(f"[AUTH] Token in {p} is expired/expiring soon, refreshing via OAuth1...")
+                        garmin.garth.refresh_oauth2()
+                        print(f"[AUTH] Refreshed and saved token from {p} successfully!")
+                    _populate_garmin_profile(garmin)
+                    _save_garmin_tokens(garmin)
+                    _garmin_client = garmin
+                    print(f"[AUTH] Active Garmin session ready from directory: {p}")
+                    return _garmin_client
+                except Exception as e:
+                    auth_errors.append(f"Dir {p.name}: {e}")
+                    print(f"[AUTH] Directory token load/refresh failed ({p}): {e}")
+                    if _is_rate_limit_error(e):
+                        raise RuntimeError(
+                            "เซิร์ฟเวอร์ Garmin จำกัดจำนวนครั้งชั่วคราว (429 Too Many Requests) ระบบหยุดยิงซ้ำและพัก Cooldown 5 นาทีเพื่อป้องกัน IP ถูกบล็อก"
+                        )
+
+    # 2. Auto-Login ด้วย GARMIN_EMAIL / GARMIN_PASSWORD แล้วบันทึกทับลง .garminconnect ทันที
+    garmin_email = os.getenv("GARMIN_EMAIL")
+    garmin_password = os.getenv("GARMIN_PASSWORD")
+    if garmin_email and garmin_password and _get_rate_limit_remaining() == 0:
+        try:
+            print(f"[AUTH] Logging in via GARMIN_EMAIL/GARMIN_PASSWORD for {garmin_email}...")
+            cred_garmin = Garmin(garmin_email, garmin_password)
+            _configure_garth_client(cred_garmin)
+            cred_garmin.login()
+            _save_garmin_tokens(cred_garmin)
+            _garmin_client = cred_garmin
+            print("[AUTH] Successfully logged in via credentials and saved tokens to .garminconnect!")
+            return _garmin_client
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                _set_rate_limit_cooldown(e)
+                raise RuntimeError(
+                    "เซิร์ฟเวอร์ Garmin จำกัดจำนวนครั้งชั่วคราว (429 Too Many Requests) ระบบหยุดยิงซ้ำและพัก Cooldown 5 นาทีเพื่อป้องกัน IP ถูกบล็อก"
+                )
+            auth_errors.append(f"Credentials login: {e}")
+            print(f"[AUTH] Credentials login failed: {e}")
+
+    # 3. Fallback สุดท้ายจาก GARMIN_TOKENS_BASE64 เฉพาะกรณีที่ยังไม่มีไฟล์ใน .garminconnect และล็อกอินปกติไม่ได้
     tokens_base64 = os.getenv("GARMIN_TOKENS_BASE64") or os.getenv("GARMINTOKENS")
-    if tokens_base64:
+    if tokens_base64 and not force_credentials and _get_rate_limit_remaining() == 0:
         clean_token = "".join(tokens_base64.split()).strip("'\"")
         missing_padding = len(clean_token) % 4
         if missing_padding:
             clean_token += "=" * (4 - missing_padding)
-
-        if hasattr(garmin, "garth"):
-            try:
-                garmin.garth.loads(clean_token)
-
-                # ตรวจสอบและ Refresh ทันทีถ้า OAuth2 หมดอายุ โดยแลกเปลี่ยนผ่าน OAuth1 Token (อายุ 1 ปี)
-                if garmin.garth.oauth2_token and garmin.garth.oauth2_token.expired:
-                    print("[AUTH] OAuth2 token is expired. Auto-refreshing on cloud via OAuth1...")
-                    garmin.garth.refresh_oauth2()
-                    print("[AUTH] Successfully refreshed OAuth2 token on cloud via OAuth1 exchange!")
-
-                if garmin.garth.profile:
-                    garmin.display_name = garmin.garth.profile.get("displayName")
-                    garmin.full_name = garmin.garth.profile.get("fullName")
-                try:
-                    settings = garmin.garth.connectapi(
-                        "/userprofile-service/userprofile/user-settings"
-                    )
-                    garmin.unit_system = settings.get("userData", {}).get("measurementSystem")
-                except Exception:
-                    pass
-
-                # บันทึกเก็บไว้ใน TOKEN_DIR เพื่อใช้งานต่อ
-                try:
-                    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-                    garmin.garth.dump(str(TOKEN_DIR))
-                except Exception:
-                    pass
-
-                _garmin_client = garmin
-                print(f"[AUTH] Successfully loaded Garmin tokens for {garmin.full_name} ({garmin.display_name})")
-                return _garmin_client
-            except Exception as e:
-                auth_errors.append(f"Base64: {e}")
-                print(f"[AUTH] Error loading Base64 token via garth: {e}")
-        else:
-            auth_errors.append("Library mismatch: 'Garmin' has no 'garth'")
-    else:
-        auth_errors.append("ไม่พบ Environment Variable 'GARMIN_TOKENS_BASE64'")
-
-    # 3. ลอง Login ด้วย Email/Password หากตั้งค่าไว้ใน Environment
-    garmin_email = os.getenv("GARMIN_EMAIL")
-    garmin_password = os.getenv("GARMIN_PASSWORD")
-    if garmin_email and garmin_password:
         try:
-            print(f"[AUTH] Attempting fallback login via username/password for {garmin_email}...")
-            cred_garmin = Garmin(garmin_email, garmin_password)
-            cred_garmin.login()
-            _garmin_client = cred_garmin
-            print(f"[AUTH] Successfully logged in via username/password!")
+            garmin.garth.loads(clean_token)
+            _configure_garth_client(garmin)
+            if _is_oauth2_expiring_soon(garmin, buffer_seconds=300):
+                garmin.garth.refresh_oauth2()
+            _populate_garmin_profile(garmin)
+            _save_garmin_tokens(garmin)
+            _garmin_client = garmin
+            print("[AUTH] Recovered Garmin session from GARMIN_TOKENS_BASE64 and saved to .garminconnect")
             return _garmin_client
         except Exception as e:
-            auth_errors.append(f"Credentials login: {e}")
-            print(f"[AUTH] Fallback login failed: {e}")
+            if _is_rate_limit_error(e):
+                _set_rate_limit_cooldown(e)
+            auth_errors.append(f"Base64: {e}")
 
-    detail = " | ".join(auth_errors) if auth_errors else "ไม่พบไฟล์ Token หรือ Credential"
+    detail = " | ".join(auth_errors) if auth_errors else "ไม่พบไฟล์ Token ใน .garminconnect หรือ GARMIN_EMAIL/GARMIN_PASSWORD"
     raise RuntimeError(
-        f"ไม่สามารถโหลด Session Garmin ได้ ({detail}) กรุณาตรวจสอบหรืออัปเดตค่า GARMIN_TOKENS_BASE64 หรือ GARMIN_EMAIL/GARMIN_PASSWORD บน Render"
+        f"ไม่สามารถโหลด Session Garmin บน Local Server ได้ ({detail}) กรุณาตรวจสอบค่า GARMIN_EMAIL/GARMIN_PASSWORD ในไฟล์ .env หรือพิมพ์ 'ล็อกอินใหม่'"
     )
+
+
+def handle_manual_relogin(force_credentials: bool = False) -> str:
+    """สั่งต่ออายุ Token หรือบังคับล็อกอินใหม่ผ่านคำสั่ง LINE"""
+    global _rate_limit_until
+    _rate_limit_until = 0.0
+    tz_bkk = timezone(timedelta(hours=7))
+    try:
+        g = get_garmin(force_refresh=True, force_credentials=force_credentials)
+        oauth2 = getattr(g.garth, "oauth2_token", None) if hasattr(g, "garth") else None
+        exp_ts = getattr(oauth2, "expires_at", 0) if oauth2 else 0
+        exp_str = datetime.fromtimestamp(exp_ts, tz=tz_bkk).strftime("%d/%m/%Y %H:%M:%S") if exp_ts else "N/A"
+        user_label = getattr(g, "full_name", None) or getattr(g, "display_name", None) or "Garmin User"
+        mode_str = "ล็อกอินใหม่ด้วย Email/Password" if force_credentials else "ต่ออายุ/รีเฟรช Session Token"
+        return (
+            f"✅ {mode_str} สำเร็จแล้ว\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 บัญชี: {user_label}\n"
+            f"🔑 OAuth2 หมดอายุ: {exp_str} (เวลาไทย)\n"
+            f"💾 บันทึก Token ล่าสุดลง .garminconnect เรียบร้อย"
+        )
+    except Exception as e:
+        return f"❌ ไม่สามารถล็อกอินใหม่ได้: {e}"
 
 
 def sanitize_line_message(text: str) -> str:
@@ -1865,24 +2104,35 @@ def push_plan_to_garmin(user_id: str) -> str:
     return "\n".join(lines)
 
 
-# Background Scheduler สำหรับส่ง 12:00 PM (เที่ยงวัน) ทุกวัน
+# Background Scheduler สำหรับส่ง 12:00 PM (เที่ยงวัน) ทุกวัน และดูแลต่ออายุ Garmin Token ล่วงหน้า
 async def daily_push_scheduler():
-    global _last_daily_push_date
+    global _last_daily_push_date, _last_token_check_ts
     tz_bkk = timezone(timedelta(hours=7))
-    print("[SCHEDULER] Daily 12:00 PM noon push notification worker started.")
+    print("[SCHEDULER] Daily 12:00 PM noon push notification & token auto-refresh worker started.")
 
     while True:
         try:
             now = datetime.now(tz_bkk)
             today_str = now.date().isoformat()
+            now_ts = time.time()
 
-            # ส่งเฉพาะช่วง 12:00 - 12:05 น. และยังไม่ได้ส่งวันนี้
+            # 1. ตรวจสอบและต่ออายุ Garmin OAuth2 Token ล่วงหน้าทุก 15 นาที (หากเหลืออายุไม่ถึง 15 นาที)
+            if now_ts - _last_token_check_ts >= 900 and _get_rate_limit_remaining() == 0:
+                _last_token_check_ts = now_ts
+                if _garmin_client is None or _is_oauth2_expiring_soon(_garmin_client, buffer_seconds=900):
+                    try:
+                        print("[SCHEDULER] Background check: ensuring Garmin session token is fresh...")
+                        await asyncio.to_thread(get_garmin)
+                    except Exception as tk_err:
+                        print(f"[SCHEDULER] Background token refresh skipped/failed: {tk_err}")
+
+            # 2. ส่งรายงานประจำวันเฉพาะช่วง 12:00 - 12:05 น. และยังไม่ได้ส่งวันนี้
             if now.hour == 12 and now.minute < 5:
                 if _last_daily_push_date != today_str:
                     print(f"[SCHEDULER] Triggering daily report for {today_str}...")
-                    report_text = handle_daily_workout_report()
+                    report_text = await asyncio.to_thread(handle_daily_workout_report)
                     if LINE_ALLOWED_USER_ID:
-                        push_line(LINE_ALLOWED_USER_ID, report_text)
+                        await asyncio.to_thread(push_line, LINE_ALLOWED_USER_ID, report_text)
                         _last_daily_push_date = today_str
         except Exception as e:
             print(f"[SCHEDULER] Error in scheduler loop: {e}")
@@ -1909,7 +2159,7 @@ def uptime_endpoint():
 
 @app.post("/update-token")
 async def update_token_endpoint(request: Request):
-    """Endpoint สำหรับรับ Token Base64 สดใหม่เพื่ออัปเดต Session บน Render ทันทีโดยไม่ต้อง Restart"""
+    """Endpoint สำหรับรับ Token Base64 สดใหม่เพื่ออัปเดต Session บน Local Server ทันทีโดยไม่ต้อง Restart"""
     secret_header = request.headers.get("X-Update-Secret", "")
     expected_secret = os.getenv("TOKEN_UPDATE_SECRET", "garmin_token_secret_sync_key")
     if secret_header != expected_secret:
@@ -1924,7 +2174,7 @@ async def update_token_endpoint(request: Request):
     if not new_token_b64:
         raise HTTPException(status_code=400, detail="Missing token_base64")
 
-    global _garmin_client
+    global _garmin_client, _rate_limit_until
     try:
         clean_token = "".join(new_token_b64.split()).strip("'\"")
         missing_padding = len(clean_token) % 4
@@ -1933,16 +2183,11 @@ async def update_token_endpoint(request: Request):
 
         new_garmin = Garmin()
         new_garmin.garth.loads(clean_token)
-        try:
-            if new_garmin.garth.profile:
-                new_garmin.display_name = new_garmin.garth.profile.get("displayName")
-                new_garmin.full_name = new_garmin.garth.profile.get("fullName")
-        except Exception as prof_err:
-            print(f"[AUTH] Non-fatal: Could not fetch profile on update: {prof_err}")
+        _configure_garth_client(new_garmin)
+        _populate_garmin_profile(new_garmin)
+        _save_garmin_tokens(new_garmin)
 
-        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        new_garmin.garth.dump(str(TOKEN_DIR))
-
+        _rate_limit_until = 0.0
         _garmin_client = new_garmin
         print(f"[AUTH] Successfully updated Garmin tokens via /update-token for {new_garmin.display_name}")
         return JSONResponse({"status": "success", "display_name": new_garmin.display_name})
@@ -1968,7 +2213,7 @@ def _run_daily_report_task(today_str: str):
 @app.post("/cron/daily-workout")
 @app.head("/cron/daily-workout")
 def cron_daily_workout(background_tasks: BackgroundTasks):
-    """Endpoint สำหรับให้ภายนอก (เช่น cron-job.org) เรียกยิงส่งข้อความตอนเที่ยงวัน เพื่อปลุก Render"""
+    """Endpoint สำหรับสั่งยิงรายงานประจำวันผ่าน HTTP Request"""
     tz_bkk = timezone(timedelta(hours=7))
     today_str = datetime.now(tz_bkk).date().isoformat()
 
@@ -2067,12 +2312,31 @@ def handle_message(event):
             "  พิมพ์: 'น้ำหนัก 68.5' หรือ 'หนัก 70'\n\n"
             "🏃 ประวัติการวิ่ง:\n"
             "  พิมพ์: 'ประวัติวิ่ง' หรือ 'วิ่งล่าสุด'\n\n"
+            "🖥️ เซิร์ฟเวอร์ & Garmin Session:\n"
+            "  • เช็กสถานะ/อายุ Token: พิมพ์ 'สถานะเซิร์ฟเวอร์'\n"
+            "  • บังคับต่ออายุ/Re-login: พิมพ์ 'ล็อกอินใหม่'\n\n"
             "💬 ปรึกษาโค้ช AI:\n"
             "  พิมพ์คำถามทั่วไปได้ทันที เช่น:\n"
             "  - 'เมื่อคืนนอนน้อย วันนี้ควรซ้อมไหม'\n"
             "  - 'HR Zone 2 สำหรับฉันควรอยู่ที่เท่าไร'"
         )
         reply_line(event.reply_token, help_msg)
+        return
+
+    # 5.1 เช็กคำสั่งบังคับต่ออายุ Token / ล็อกอินใหม่
+    relogin_triggers = [
+        "ล็อกอินใหม่",
+        "ล็อคอินใหม่",
+        "รีเซ็ต token",
+        "รีเฟรช token",
+        "ต่ออายุ token",
+        "relogin",
+        "refresh token",
+    ]
+    if user_text.lower() in relogin_triggers or user_text.lower() == "ล็อกอินใหม่ด้วยรหัส":
+        force_cred = user_text.lower() == "ล็อกอินใหม่ด้วยรหัส"
+        relogin_res = handle_manual_relogin(force_credentials=force_cred)
+        reply_line(event.reply_token, relogin_res)
         return
 
     # 6. เช็กคำขอตารางซ้อมล่วงหน้า 7 วัน
