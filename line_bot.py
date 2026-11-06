@@ -537,7 +537,18 @@ def handle_record_weight(user_text: str) -> str:
 
     try:
         garmin = get_garmin()
-        garmin.add_weigh_in(weight=weight_val, unitKey="kg")
+        url = f"{getattr(garmin, 'garmin_connect_weight_url', '/weight-service')}/user-weight"
+        dt = datetime.now()
+        dt_gmt = datetime.utcnow()
+        payload = {
+            "dateTimestamp": dt.strftime("%Y-%m-%dT%H:%M:%S.00"),
+            "gmtTimestamp": dt_gmt.strftime("%Y-%m-%dT%H:%M:%S.00"),
+            "unitKey": "kg",
+            "sourceType": "MANUAL",
+            "value": weight_val,
+        }
+        # ต้องส่ง api=True เพื่อให้ garth แนบ Authorization: Bearer OAuth2 token ไปยัง connectapi
+        garmin.garth.post("connectapi", url, json=payload, api=True)
         return f"✅ บันทึกน้ำหนัก {weight_val} kg ลงใน Garmin Connect สำเร็จแล้ว"
     except Exception as e:
         return f"❌ ไม่สามารถบันทึกน้ำหนักได้: {e}"
